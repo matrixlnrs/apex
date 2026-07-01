@@ -53,6 +53,7 @@
 #define AIRTIME_MIN_MS   80   /* rejette les faux declenchements (bruit) */
 #define AIRTIME_MAX_MS 2000   /* garde-fou : au dela on annule la mesure */
 #define GRAVITY_MG     1000   /* 1 g de reference */
+#define FF_CONFIRM_MS    15   /* chute libre confirmee si |a| reste bas >= ce temps */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -231,6 +232,15 @@ static void Display_Height(float h_cm) {
         MAX7219_DisplayChar  (4, '0' +  t        % 10);     // dixiemes de cm
     }
 }
+
+/* Affiche "----" (indicateur de vol en cours). Ecrit une seule fois a l'entree
+   de RUNNING : aucune ecriture SPI pendant le vol -> pas de jitter sur la detection. */
+static void Display_Dashes(void) {
+    MAX7219_DisplayChar(1, '-');
+    MAX7219_DisplayChar(2, '-');
+    MAX7219_DisplayChar(3, '-');
+    MAX7219_DisplayChar(4, '-');
+}
 /* USER CODE END 0 */
 
 /**
@@ -282,7 +292,7 @@ int main(void)
   /* --- LSM6DSO : accelero + detection chute libre (INT1) / impact (INT2) --- */
   uint8_t who = LSM6DSO_Read(LSM6DSO_WHO_AM_I);
   printf("[LSM6DSO] WHO_AM_I = 0x%02X (attendu 0x6C)\r\n", who);
-  LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x40);    // ODR 104 Hz, plage +/-2g
+  LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x60);    // ODR 416 Hz, plage +/-2g (echantillonnage rapide)
   LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);     // auto-increment des registres
   LSM6DSO_Write(LSM6DSO_FREE_FALL, 0x33);   // seuil chute libre ~312 mg, duree ~58 ms
   LSM6DSO_Write(LSM6DSO_WAKE_UP_THS, 0x08); // seuil impact = 8 x 62.5 mg = 500 mg
@@ -301,27 +311,14 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	  static AppState_t prev_state = APP_IDLE;
-	  static uint32_t   last_shown = 0xFFFFFFFF;
 
-	  /* --- Phase B2 : LSM6DSO integre a la state machine (voir EXTI3/EXTI4
-	     dans stm32l1xx_it.c) : le decollage/atterrissage demarre/arrete le
-	     chrono automatiquement, ces blocs ne servent plus qu'au log UART. --- */
-	  if (flag_takeoff) {
-	      flag_takeoff = 0;
-	      printf(">>> DECOLLAGE (chute libre) detecte ! <<<\r\n");
-	  }
-	  if (flag_landing) {
-	      flag_landing = 0;
-	      printf(">>> ATTERRISSAGE (impact) detecte ! <<<\r\n");
-	  }
-
-	  /* --- Echantillonnage accelero ~10 ms (aligne sur l'ODR 104 Hz) :
-	     sert a la fois a la detection de saut et au log UART (throttle 200 ms). --- */
-	  static uint32_t last_acc = 0;
+	  /* --- Echantillonnage accelero a CHAQUE tour de boucle (resolution maxi) :
+	     avec ODR 416 Hz + I2C 400 kHz, une lecture prend ~0.2 ms -> on ne rate
+	     plus ni le creux de chute libre ni le pic d'impact. --- */
 	  static uint32_t last_log = 0;
-	  static uint32_t mag = GRAVITY_MG;   // |a| courant, dispo pour la detection
-	  if (HAL_GetTick() - last_acc >= 10) {
-	      last_acc = HAL_GetTick();
+	  static uint32_t mag = GRAVITY_MG;       // |a| courant en mg
+	  static uint32_t ff_start = 0;           // debut de la fenetre de chute libre (0 = pas en chute libre)
+	  {
 	      int16_t ax, ay, az;
 	      LSM6DSO_ReadAccel(&ax, &ay, &az);
 	      /* conversion en mg : 0.061 mg/LSB a +/-2g */
@@ -329,16 +326,13 @@ int main(void)
 	      int32_t my = (int32_t)ay * 61 / 1000;
 	      int32_t mz = (int32_t)az * 61 / 1000;
 	      mag = (uint32_t)sqrtf((float)(mx*mx + my*my + mz*mz));
+	  }
 
-	      /* log UART allege : une ligne toutes les 200 ms.
-	         DIAG : on affiche l'etat (0=IDLE 1=RUNNING 2=RESULT), tim_ms (TIM6)
-	         et t_start pour verifier que le chrono avance vraiment. */
-	      if (HAL_GetTick() - last_log >= 200) {
-	          last_log = HAL_GetTick();
-	          printf("A: |a|=%lu mg  S=%d tim=%lu tstart=%lu\r\n",
-	                 (unsigned long)mag, (int)state,
-	                 (unsigned long)tim_ms, (unsigned long)t_start);
-	      }
+	  /* Log UART throttle 200 ms, UNIQUEMENT au repos : pendant le vol le printf
+	     (~3 ms bloquant) jitterait la detection d'impact. */
+	  if (state == APP_IDLE && HAL_GetTick() - last_log >= 200) {
+	      last_log = HAL_GetTick();
+	      printf("A: |a|=%lu mg\r\n", (unsigned long)mag);
 	  }
 
 	  /* Etat reellement traite a cette iteration : sert a detecter l'entree
@@ -350,37 +344,39 @@ int main(void)
 
 	  case APP_IDLE:
 	      if (prev_state != APP_IDLE) {
-	          printf("IDLE - Saute (ou BP1) pour demarrer\r\n");
+	          printf("IDLE - Saute pour demarrer\r\n");
 	          Display_Time(0);
-	          last_shown = 0;
+	          ff_start = 0;
 	      }
-	      /* Detection DECOLLAGE : |a| chute sous le seuil de chute libre */
+	      /* Detection DECOLLAGE : chute libre confirmee sur >= FF_CONFIRM_MS.
+	         t_start = instant ou |a| est PASSE sous le seuil (backdate) -> pas
+	         de retard sur la mesure, et un simple pic de bruit ne declenche pas. */
 	      if (mag < FREEFALL_MG) {
-	          t_start = tim_ms;
-	          state = APP_RUNNING;
-	          printf(">> TAKEOFF  mag=%lu  t_start=%lu (tim_ms)\r\n",
-	                 (unsigned long)mag, (unsigned long)t_start);
+	          if (ff_start == 0) ff_start = tim_ms;          // debut du creux
+	          if (tim_ms - ff_start >= FF_CONFIRM_MS) {
+	              t_start = ff_start;                        // vrai instant de decollage
+	              state = APP_RUNNING;
+	              printf(">> TAKEOFF t_start=%lu\r\n", (unsigned long)t_start);
+	          }
+	      } else {
+	          ff_start = 0;                                  // pas (ou plus) en chute libre
 	      }
 	      break;
 
 	  case APP_RUNNING:
 	      if (prev_state != APP_RUNNING) {
 	          printf("RUNNING - en l'air...\r\n");
+	          Display_Dashes();      // affichage fige "----", zero SPI pendant le vol
 	      }
 	      {
 	          uint32_t elapsed = tim_ms - t_start;   // temps ecoule en ms
-	          if (elapsed != last_shown) {
-	              Display_Time(elapsed);             // mise a jour en direct
-	              last_shown = elapsed;
-	          }
 	          /* Detection ATTERRISSAGE : pic d'acceleration (impact) */
 	          if (mag > IMPACT_MG) {
 	              uint32_t air = tim_ms - t_start;
-	              printf(">> LANDING  mag=%lu  air=%lu ms\r\n",
-	                     (unsigned long)mag, (unsigned long)air);
 	              if (air >= AIRTIME_MIN_MS && air <= AIRTIME_MAX_MS) {
 	                  hang_time = air;               // temps en l'air valide
 	                  state = APP_RESULT;
+	                  printf(">> LANDING air=%lu ms\r\n", (unsigned long)air);
 	              } else {
 	                  /* trop court/trop long => faux declenchement, on annule */
 	                  printf("(faux declenchement : %lu ms ignore)\r\n",
@@ -536,7 +532,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
+  hi2c1.Init.ClockSpeed = 400000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;

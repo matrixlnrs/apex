@@ -9,6 +9,6 @@
 ../Core/Src/max7219_Yncrea2.c:254:6:MAX7219_Clear	16	static
 ../Core/Src/max7219_Yncrea2.c:272:6:MAX7219_DisplayChar	16	static
 ../Core/Src/max7219_Yncrea2.c:289:6:MAX7219_DisplayCharDP	24	static
-../Core/Src/max7219_Yncrea2.c:364:22:MAX7219_LookupCode	24	static
-../Core/Src/max7219_Yncrea2.c:384:13:MAX7219_Write	16	static
-../Core/Src/max7219_Yncrea2.c:417:13:MAX7219_SendByte	16	static
+../Core/Src/max7219_Yncrea2.c:365:22:MAX7219_LookupCode	24	static
+../Core/Src/max7219_Yncrea2.c:385:13:MAX7219_Write	16	static
+../Core/Src/max7219_Yncrea2.c:418:13:MAX7219_SendByte	16	static

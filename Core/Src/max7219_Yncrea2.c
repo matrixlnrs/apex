@@ -319,6 +319,7 @@ static const struct {
 	char   segs;
 } MAX7219_Font[] = {
   {' ', 0x80},
+  {'-', 0x01},   /* segment g (milieu) = tiret */
   {'0', 0x7e},
   {'1', 0x30},
   {'2', 0x6d},

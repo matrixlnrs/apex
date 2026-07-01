@@ -60,8 +60,8 @@ all: main-build
 main-build: APEX_PROJECT.elf secondary-outputs
 
 # Tool invocations
-APEX_PROJECT.elf APEX_PROJECT.map: $(OBJS) $(USER_OBJS) /Users/mathislnrs/Desktop/ISEN/ISENA3/STM32/apex/STM32L152RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "APEX_PROJECT.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"/Users/mathislnrs/Desktop/ISEN/ISENA3/STM32/apex/STM32L152RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="APEX_PROJECT.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+APEX_PROJECT.elf APEX_PROJECT.map: $(OBJS) $(USER_OBJS) /Users/jugo/Documents/ISEN/ISENA3/SYSTEME_MICROPROCESSEUR/APEX_PROJECT/STM32L152RETX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "APEX_PROJECT.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"/Users/jugo/Documents/ISEN/ISENA3/SYSTEME_MICROPROCESSEUR/APEX_PROJECT/STM32L152RETX_FLASH.ld" --specs=nosys.specs -Wl,-Map="APEX_PROJECT.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
