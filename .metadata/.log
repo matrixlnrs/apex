@@ -1,0 +1,33 @@
+
+!ENTRY org.eclipse.ui.ide 4 4 2026-07-01 18:40:33.813
+!MESSAGE Problems saving workspace
+
+!ENTRY org.eclipse.ui.ide 4 1 2026-07-01 18:40:33.816
+!MESSAGE Problems occurred while trying to save the state of the workbench.
+!SUBENTRY 1 org.eclipse.core.resources 4 568 2026-07-01 18:40:33.816
+!MESSAGE Could not write workspace metadata '/Users/mathislnrs/Desktop/ISEN/ISENA3/STM32/apex/.metadata/.plugins/org.eclipse.core.resources/.root/2.tree'.
+!STACK 0
+java.io.FileNotFoundException: /Users/mathislnrs/Desktop/ISEN/ISENA3/STM32/apex/.metadata/.plugins/org.eclipse.core.resources/.root/2.tree (No such file or directory)
+	at java.base/java.io.FileOutputStream.open0(Native Method)
+	at java.base/java.io.FileOutputStream.open(FileOutputStream.java:289)
+	at java.base/java.io.FileOutputStream.<init>(FileOutputStream.java:230)
+	at java.base/java.io.FileOutputStream.<init>(FileOutputStream.java:179)
+	at org.eclipse.core.internal.localstore.SafeFileOutputStream.<init>(SafeFileOutputStream.java:55)
+	at org.eclipse.core.internal.resources.SaveManager.saveTree(SaveManager.java:1424)
+	at org.eclipse.core.internal.resources.SaveManager.save(SaveManager.java:1230)
+	at org.eclipse.core.internal.resources.Workspace.save(Workspace.java:2492)
+	at org.eclipse.ui.internal.ide.application.IDEWorkbenchAdvisor.lambda$1(IDEWorkbenchAdvisor.java:553)
+	at org.eclipse.jface.operation.ModalContext$ModalContextThread.run(ModalContext.java:124)
+!SESSION 2026-07-01 18:40:36.769 -----------------------------------------------
+eclipse.buildId=Version 2.1.1
+java.version=21.0.9
+java.vendor=Eclipse Adoptium
+BootLoader constants: OS=macosx, ARCH=aarch64, WS=cocoa, NL=en_US
+Framework arguments:  -keyring /Users/mathislnrs/.eclipse_keyring
+Command-line arguments:  -os macosx -ws cocoa -arch aarch64 -keyring /Users/mathislnrs/.eclipse_keyring
+
+!ENTRY com.st.stm32cube.ide.mcu.informationcenter 1 1 2026-07-01 18:40:42.704
+!MESSAGE Log4j2 initialized with config file /Users/mathislnrs/Desktop/ISEN/ISENA3/STM32/apex/.metadata/.log4j2.xml
+
+!ENTRY com.st.stm32cube.ide.mcu.ide 1 1 2026-07-01 18:40:45.156
+!MESSAGE Started RMI Server, listening on port 41337

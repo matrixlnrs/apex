@@ -46,6 +46,13 @@
 #define LSM6DSO_MD1_CFG     0x5E /* routage vers INT1 */
 #define LSM6DSO_MD2_CFG     0x5F /* routage vers INT2 */
 #define LSM6DSO_ALL_INT_SRC 0x1A /* lecture pour acquitter les IT */
+
+/* --- Detection de saut par seuils logiciels sur |a| (en mg) --- */
+#define FREEFALL_MG     300   /* |a| sous ce seuil = chute libre => decollage */
+#define IMPACT_MG      1800   /* |a| au dessus de ce seuil = impact => atterrissage */
+#define AIRTIME_MIN_MS   80   /* rejette les faux declenchements (bruit) */
+#define AIRTIME_MAX_MS 2000   /* garde-fou : au dela on annule la mesure */
+#define GRAVITY_MG     1000   /* 1 g de reference */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,6 +80,10 @@ volatile uint32_t   hang_time = 0;
 volatile uint8_t flag_takeoff = 0;   /* INT1 : chute libre (decollage) */
 volatile uint8_t flag_landing = 0;   /* INT2 : impact (atterrissage) */
 
+/* DIAG : compteurs d'IT pour detecter un emballement (PB3 = SWO partage ?) */
+volatile uint32_t exti3_irq_count = 0;   /* INT2 / PB3 */
+volatile uint32_t exti4_irq_count = 0;   /* INT1 / PB4 */
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -92,6 +103,54 @@ static void MX_USART2_UART_Init(void);
 int __io_putchar(int ch) {
     HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, 10);
     return ch;
+}
+
+/* DIAG + RECUPERATION du bus I2C1 (PB8=SCL, PB9=SDA).
+   A appeler AVANT toute transaction I2C. Lit l'etat des lignes au repos :
+   une ligne a 0 au repos => bus bloque (esclave coince, pull-up absent, ou
+   carte non alimentee). Puis genere jusqu'a 9 impulsions d'horloge sur SCL
+   pour liberer un esclave qui tient SDA bas, suivies d'un STOP manuel. */
+static void I2C_BusRecover(void) {
+    GPIO_InitTypeDef g = {0};
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* Coupe le peripherique I2C pour reprendre la main sur les broches */
+    HAL_I2C_DeInit(&hi2c1);
+
+    /* PB8/PB9 en open-drain GPIO avec pull-up, niveau haut (relache) */
+    g.Pin   = GPIO_PIN_8 | GPIO_PIN_9;
+    g.Mode  = GPIO_MODE_OUTPUT_OD;
+    g.Pull  = GPIO_PULLUP;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOB, &g);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_Delay(1);
+
+    int scl = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8);
+    int sda = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
+    printf("[I2C] Etat repos : SCL=%d SDA=%d (attendu 1/1)\r\n", scl, sda);
+
+    if (sda == 0) {
+        printf("[I2C] SDA bloque a 0 -> tentative de deblocage (9 clocks)\r\n");
+        for (int i = 0; i < 9; i++) {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+            HAL_Delay(1);
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+            HAL_Delay(1);
+            if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == 1) break;  /* SDA relache */
+        }
+        /* Condition de STOP : SDA passe de 0 a 1 pendant que SCL est haut */
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+        HAL_Delay(1);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+        HAL_Delay(1);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+        HAL_Delay(1);
+    }
+
+    /* Remet le peripherique I2C en service (reconfigure PB8/PB9 en AF) */
+    MX_I2C1_Init();
+    printf("[I2C] Bus reinitialise\r\n");
 }
 
 static void I2C_Scan(void) {
@@ -128,9 +187,13 @@ static uint8_t LSM6DSO_Read(uint8_t reg) {
 /* Lit les 3 axes accelero (raw, LSB). Auto-increment active via CTRL3_C. */
 static void LSM6DSO_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az) {
     uint8_t reg = LSM6DSO_OUTX_L_A;
-    uint8_t d[6];
-    HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
-    HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, d, 6, 10);
+    uint8_t d[6] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};  /* DIAG : sentinelle si jamais ecrasee */
+    HAL_StatusTypeDef st_tx = HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
+    HAL_StatusTypeDef st_rx = HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, d, 6, 10);
+    if (st_tx != HAL_OK || st_rx != HAL_OK) {
+        printf("[I2C] ERREUR lecture accel : tx=%d rx=%d err=0x%lx\r\n",
+               st_tx, st_rx, (unsigned long)HAL_I2C_GetError(&hi2c1));
+    }
     *ax = (int16_t)(d[1] << 8 | d[0]);
     *ay = (int16_t)(d[3] << 8 | d[2]);
     *az = (int16_t)(d[5] << 8 | d[4]);
@@ -146,6 +209,27 @@ static void Display_Time(uint32_t ms) {
     MAX7219_DisplayChar(2, '0' + (frac / 100) % 10);    // millisecondes (centaines)
     MAX7219_DisplayChar(3, '0' + (frac / 10) % 10);     // millisecondes (dizaines)
     MAX7219_DisplayChar(4, '0' + (frac % 10));          // millisecondes (unites), a DROITE
+}
+
+/* Affiche une hauteur de saut en cm sur le MAX7219.
+   < 100 cm : format XX.X (point decimal sur le digit des unites de cm).
+   >= 100 cm : format XXX (cm entiers, cas rare). */
+static void Display_Height(float h_cm) {
+    MAX7219_Clear();                       // digits inutilises => vraiment eteints
+    if (h_cm < 0.0f) h_cm = 0.0f;
+
+    if (h_cm >= 100.0f) {
+        uint32_t cm = (uint32_t)(h_cm + 0.5f);
+        if (cm > 999) cm = 999;
+        MAX7219_DisplayChar(2, '0' + (cm / 100) % 10);  // centaines de cm
+        MAX7219_DisplayChar(3, '0' + (cm / 10)  % 10);  // dizaines
+        MAX7219_DisplayChar(4, '0' +  cm        % 10);  // unites
+    } else {
+        uint32_t t = (uint32_t)(h_cm * 10.0f + 0.5f);   // hauteur en dixiemes de cm
+        MAX7219_DisplayChar  (2, '0' + (t / 100) % 10);     // dizaines de cm
+        MAX7219_DisplayCharDP(3, '0' + (t / 10)  % 10, 1);  // unites de cm + point
+        MAX7219_DisplayChar  (4, '0' +  t        % 10);     // dixiemes de cm
+    }
 }
 /* USER CODE END 0 */
 
@@ -186,6 +270,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_Delay(100);
   printf("=== VertiSense Ready ===\r\n");
+  I2C_BusRecover();     /* diagnostic + deblocage du bus avant tout acces */
   I2C_Scan();
 
   MAX7219_Init();
@@ -218,7 +303,9 @@ int main(void)
 	  static AppState_t prev_state = APP_IDLE;
 	  static uint32_t   last_shown = 0xFFFFFFFF;
 
-	  /* --- Phase B1 : validation des interruptions LSM6DSO --- */
+	  /* --- Phase B2 : LSM6DSO integre a la state machine (voir EXTI3/EXTI4
+	     dans stm32l1xx_it.c) : le decollage/atterrissage demarre/arrete le
+	     chrono automatiquement, ces blocs ne servent plus qu'au log UART. --- */
 	  if (flag_takeoff) {
 	      flag_takeoff = 0;
 	      printf(">>> DECOLLAGE (chute libre) detecte ! <<<\r\n");
@@ -228,9 +315,12 @@ int main(void)
 	      printf(">>> ATTERRISSAGE (impact) detecte ! <<<\r\n");
 	  }
 
-	  /* --- Phase A : lecture accelero toutes les 200 ms (UART) --- */
+	  /* --- Echantillonnage accelero ~10 ms (aligne sur l'ODR 104 Hz) :
+	     sert a la fois a la detection de saut et au log UART (throttle 200 ms). --- */
 	  static uint32_t last_acc = 0;
-	  if (HAL_GetTick() - last_acc >= 200) {
+	  static uint32_t last_log = 0;
+	  static uint32_t mag = GRAVITY_MG;   // |a| courant, dispo pour la detection
+	  if (HAL_GetTick() - last_acc >= 10) {
 	      last_acc = HAL_GetTick();
 	      int16_t ax, ay, az;
 	      LSM6DSO_ReadAccel(&ax, &ay, &az);
@@ -238,24 +328,44 @@ int main(void)
 	      int32_t mx = (int32_t)ax * 61 / 1000;
 	      int32_t my = (int32_t)ay * 61 / 1000;
 	      int32_t mz = (int32_t)az * 61 / 1000;
-	      uint32_t mag = (uint32_t)sqrtf((float)(mx*mx + my*my + mz*mz));
-	      printf("A: X=%ld Y=%ld Z=%ld  |a|=%lu mg\r\n",
-	             (long)mx, (long)my, (long)mz, (unsigned long)mag);
+	      mag = (uint32_t)sqrtf((float)(mx*mx + my*my + mz*mz));
+
+	      /* log UART allege : une ligne toutes les 200 ms.
+	         DIAG : on affiche l'etat (0=IDLE 1=RUNNING 2=RESULT), tim_ms (TIM6)
+	         et t_start pour verifier que le chrono avance vraiment. */
+	      if (HAL_GetTick() - last_log >= 200) {
+	          last_log = HAL_GetTick();
+	          printf("A: |a|=%lu mg  S=%d tim=%lu tstart=%lu\r\n",
+	                 (unsigned long)mag, (int)state,
+	                 (unsigned long)tim_ms, (unsigned long)t_start);
+	      }
 	  }
+
+	  /* Etat reellement traite a cette iteration : sert a detecter l'entree
+	     dans un nouvel etat SANS se faire pieger par un changement de `state`
+	     opere a l'interieur du switch (sinon le corps de RESULT est saute). */
+	  AppState_t handling = state;
 
 	  switch (state) {
 
 	  case APP_IDLE:
 	      if (prev_state != APP_IDLE) {
-	          printf("IDLE - Appuie BP1 pour demarrer\r\n");
+	          printf("IDLE - Saute (ou BP1) pour demarrer\r\n");
 	          Display_Time(0);
 	          last_shown = 0;
+	      }
+	      /* Detection DECOLLAGE : |a| chute sous le seuil de chute libre */
+	      if (mag < FREEFALL_MG) {
+	          t_start = tim_ms;
+	          state = APP_RUNNING;
+	          printf(">> TAKEOFF  mag=%lu  t_start=%lu (tim_ms)\r\n",
+	                 (unsigned long)mag, (unsigned long)t_start);
 	      }
 	      break;
 
 	  case APP_RUNNING:
 	      if (prev_state != APP_RUNNING) {
-	          printf("RUNNING - Appuie BP2 pour arreter\r\n");
+	          printf("RUNNING - en l'air...\r\n");
 	      }
 	      {
 	          uint32_t elapsed = tim_ms - t_start;   // temps ecoule en ms
@@ -263,20 +373,51 @@ int main(void)
 	              Display_Time(elapsed);             // mise a jour en direct
 	              last_shown = elapsed;
 	          }
+	          /* Detection ATTERRISSAGE : pic d'acceleration (impact) */
+	          if (mag > IMPACT_MG) {
+	              uint32_t air = tim_ms - t_start;
+	              printf(">> LANDING  mag=%lu  air=%lu ms\r\n",
+	                     (unsigned long)mag, (unsigned long)air);
+	              if (air >= AIRTIME_MIN_MS && air <= AIRTIME_MAX_MS) {
+	                  hang_time = air;               // temps en l'air valide
+	                  state = APP_RESULT;
+	              } else {
+	                  /* trop court/trop long => faux declenchement, on annule */
+	                  printf("(faux declenchement : %lu ms ignore)\r\n",
+	                         (unsigned long)air);
+	                  state = APP_IDLE;
+	              }
+	          } else if (elapsed > AIRTIME_MAX_MS) {
+	              /* jamais d'impact detecte => on abandonne la mesure */
+	              printf("(timeout : pas d'impact detecte)\r\n");
+	              state = APP_IDLE;
+	          }
 	      }
 	      break;
 
 	  case APP_RESULT:
 	      if (prev_state != APP_RESULT) {
-	          printf("Temps : %lu ms\r\n", hang_time);
-	          Display_Time(hang_time);               // fige le resultat final
-	          HAL_Delay(3000);
+	          /* Hauteur du saut a partir du temps de vol :
+	             temps montee = temps descente = t/2, donc
+	             h = 1/2 * g * (t/2)^2 = g * t^2 / 8  (t en s, g = 9.81 m/s^2).
+	             En cm : h_cm = 9.81 * (t_ms/1000)^2 / 8 * 100 */
+	          float t_s  = hang_time / 1000.0f;
+	          float h_cm = 9.81f * t_s * t_s / 8.0f * 100.0f;
+	          printf("=== Temps en l'air : %lu ms  ->  hauteur : %d.%d cm ===\r\n",
+	                 (unsigned long)hang_time,
+	                 (int)h_cm, (int)(h_cm * 10.0f + 0.5f) % 10);
+	          /* Alterne HAUTEUR (resultat principal) et TEMPS en l'air, en
+	             terminant sur la hauteur. Formats distincts a l'ecran :
+	             hauteur "42.7" (digit gauche eteint), temps "0.590". */
+	          Display_Height(h_cm);   HAL_Delay(2000);
+	          Display_Time(hang_time); HAL_Delay(2000);
+	          Display_Height(h_cm);   HAL_Delay(2000);
 	          state = APP_IDLE;
 	      }
 	      break;
 	  }
 
-	  prev_state = state;
+	  prev_state = handling;   // etat traite, pas l'etat (eventuellement) modifie
   }
   /* USER CODE END 3 */
 }
