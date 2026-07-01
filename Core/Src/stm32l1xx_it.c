@@ -64,11 +64,6 @@ extern volatile AppState_t state;
 extern volatile uint32_t t_start;
 extern volatile uint32_t hang_time;
 
-extern volatile uint8_t flag_takeoff;   /* INT1 LSM6DSO : chute libre */
-extern volatile uint8_t flag_landing;   /* INT2 LSM6DSO : impact */
-
-extern volatile uint32_t exti3_irq_count;
-extern volatile uint32_t exti4_irq_count;
 
 /* USER CODE END EV */
 
@@ -216,10 +211,8 @@ void SysTick_Handler(void)
 void EXTI3_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI3_IRQn 0 */
-	/* Detection desormais logicielle (seuils sur |a| dans main.c) :
-	   on ne fait plus que du diagnostic ici, pas de transition d'etat. */
-	exti3_irq_count++;
-	flag_landing = 1;
+	/* Detection de saut geree en logiciel dans main.c (seuils sur |a|).
+	   L'INT materielle du LSM6DSO n'est pas utilisee : on ne fait qu'acquitter. */
   /* USER CODE END EXTI3_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(LSM_INT2_Pin);
   /* USER CODE BEGIN EXTI3_IRQn 1 */
@@ -233,10 +226,8 @@ void EXTI3_IRQHandler(void)
 void EXTI4_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI4_IRQn 0 */
-	/* Detection desormais logicielle (seuils sur |a| dans main.c) :
-	   on ne fait plus que du diagnostic ici, pas de transition d'etat. */
-	exti4_irq_count++;
-	flag_takeoff = 1;
+	/* Detection de saut geree en logiciel dans main.c (seuils sur |a|).
+	   L'INT materielle du LSM6DSO n'est pas utilisee : on ne fait qu'acquitter. */
   /* USER CODE END EXTI4_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(LSM_INT1_Pin);
   /* USER CODE BEGIN EXTI4_IRQn 1 */

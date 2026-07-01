@@ -47,10 +47,22 @@
 #define LSM6DSO_MD2_CFG     0x5F /* routage vers INT2 */
 #define LSM6DSO_ALL_INT_SRC 0x1A /* lecture pour acquitter les IT */
 
-/* --- Detection de saut par seuils logiciels sur |a| (en mg) --- */
-#define FREEFALL_MG     300   /* |a| sous ce seuil = chute libre => decollage */
-#define IMPACT_MG      1800   /* |a| au dessus de ce seuil = impact => atterrissage */
-#define AIRTIME_MIN_MS   80   /* rejette les faux declenchements (bruit) */
+/* HTS221 (temperature + humidite) - 2e capteur, adresse I2C 8 bits (0x5F<<1) */
+#define HTS221_ADDR        0xBE
+#define HTS221_WHO_AM_I    0x0F   /* doit valoir 0xBC */
+#define HTS221_AV_CONF     0x10   /* moyennage T/H */
+#define HTS221_CTRL_REG1   0x20   /* PD (actif), BDU, ODR */
+#define HTS221_HUM_OUT_L   0x28   /* debut H_L,H_H,T_L,T_H (0x28..0x2B) */
+#define HTS221_CALIB_START 0x30   /* 16 octets de calibration (0x30..0x3F) */
+#define HTS221_AUTOINC     0x80   /* MSB du sous-registre = auto-increment I2C */
+
+/* --- Detection de saut : on mesure la duree de la fenetre d'apesanteur,
+   avec confirmation (anti-rebond) sur les deux bords pour ignorer les
+   a-coups parasites (appareil tenu a la main). Seuils en mg. --- */
+#define FREEFALL_MG     350   /* |a| sous ce seuil = apesanteur (en vol) */
+#define LANDED_MG       700   /* |a| au dessus = revenu au sol (hysteresis) */
+#define CONFIRM_MS       50   /* duree mini pour valider decollage/atterrissage */
+#define AIRTIME_MIN_MS  120   /* rejette les micro-declenchements */
 #define AIRTIME_MAX_MS 2000   /* garde-fou : au dela on annule la mesure */
 #define GRAVITY_MG     1000   /* 1 g de reference */
 /* USER CODE END PD */
@@ -72,18 +84,9 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-volatile AppState_t state   = APP_IDLE;
-volatile uint32_t   t_start = 0;
-volatile uint32_t   hang_time = 0;
-
-/* Phase B1 : flags leves par les ISR LSM6DSO (validation detection) */
-volatile uint8_t flag_takeoff = 0;   /* INT1 : chute libre (decollage) */
-volatile uint8_t flag_landing = 0;   /* INT2 : impact (atterrissage) */
-
-/* DIAG : compteurs d'IT pour detecter un emballement (PB3 = SWO partage ?) */
-volatile uint32_t exti3_irq_count = 0;   /* INT2 / PB3 */
-volatile uint32_t exti4_irq_count = 0;   /* INT1 / PB4 */
-
+volatile AppState_t state   = APP_IDLE;   /* etat de la mesure de saut */
+volatile uint32_t   t_start = 0;          /* tim_ms au decollage */
+volatile uint32_t   hang_time = 0;        /* temps en l'air mesure (ms) */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -126,12 +129,10 @@ static void I2C_BusRecover(void) {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
     HAL_Delay(1);
 
-    int scl = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8);
     int sda = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
-    printf("[I2C] Etat repos : SCL=%d SDA=%d (attendu 1/1)\r\n", scl, sda);
 
     if (sda == 0) {
-        printf("[I2C] SDA bloque a 0 -> tentative de deblocage (9 clocks)\r\n");
+        printf("[I2C] SDA bloque -> deblocage du bus\r\n");
         for (int i = 0; i < 9; i++) {
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
             HAL_Delay(1);
@@ -150,17 +151,6 @@ static void I2C_BusRecover(void) {
 
     /* Remet le peripherique I2C en service (reconfigure PB8/PB9 en AF) */
     MX_I2C1_Init();
-    printf("[I2C] Bus reinitialise\r\n");
-}
-
-static void I2C_Scan(void) {
-    printf("--- Scan I2C ---\r\n");
-    for (uint8_t addr = 1; addr < 128; addr++) {
-        if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 1, 10) == HAL_OK) {
-            printf("Trouve : 0x%02X\r\n", addr << 1);
-        }
-    }
-    printf("--- Fin scan ---\r\n");
 }
 
 volatile uint32_t tim_ms = 0;
@@ -187,16 +177,75 @@ static uint8_t LSM6DSO_Read(uint8_t reg) {
 /* Lit les 3 axes accelero (raw, LSB). Auto-increment active via CTRL3_C. */
 static void LSM6DSO_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az) {
     uint8_t reg = LSM6DSO_OUTX_L_A;
-    uint8_t d[6] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};  /* DIAG : sentinelle si jamais ecrasee */
-    HAL_StatusTypeDef st_tx = HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
-    HAL_StatusTypeDef st_rx = HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, d, 6, 10);
-    if (st_tx != HAL_OK || st_rx != HAL_OK) {
-        printf("[I2C] ERREUR lecture accel : tx=%d rx=%d err=0x%lx\r\n",
-               st_tx, st_rx, (unsigned long)HAL_I2C_GetError(&hi2c1));
-    }
+    uint8_t d[6];
+    HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, d, 6, 10);
     *ax = (int16_t)(d[1] << 8 | d[0]);
     *ay = (int16_t)(d[3] << 8 | d[2]);
     *az = (int16_t)(d[5] << 8 | d[4]);
+}
+
+/* ===== HTS221 : temperature + humidite (2e capteur) ===== */
+/* Coefficients de calibration usine, lus une fois a l'init. */
+static float   hts_T0_degC, hts_T1_degC, hts_H0_rH, hts_H1_rH;
+static int16_t hts_T0_OUT,  hts_T1_OUT,  hts_H0_OUT, hts_H1_OUT;
+
+static void HTS221_Write(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = {reg, val};
+    HAL_I2C_Master_Transmit(&hi2c1, HTS221_ADDR, buf, 2, 10);
+}
+
+static uint8_t HTS221_Read(uint8_t reg) {
+    uint8_t val = 0;
+    HAL_I2C_Master_Transmit(&hi2c1, HTS221_ADDR, &reg, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c1, HTS221_ADDR, &val, 1, 10);
+    return val;
+}
+
+/* Lecture multi-octets : le HTS221 exige le bit MSB du sous-registre pour
+   l'auto-increment (sinon on relit toujours le meme registre). */
+static void HTS221_ReadMulti(uint8_t reg, uint8_t *buf, uint8_t n) {
+    uint8_t r = reg | HTS221_AUTOINC;
+    HAL_I2C_Master_Transmit(&hi2c1, HTS221_ADDR, &r, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c1, HTS221_ADDR, buf, n, 10);
+}
+
+static void HTS221_Init(void) {
+    uint8_t who = HTS221_Read(HTS221_WHO_AM_I);
+    printf("Capteur 2 - Temp/Humidite HTS221 : %s\r\n",
+           (who == 0xBC) ? "OK" : "ABSENT");
+
+    HTS221_Write(HTS221_AV_CONF,   0x1B);   // moyennage par defaut (T=16, H=32)
+    HTS221_Write(HTS221_CTRL_REG1, 0x85);   // PD=1 (actif), BDU=1, ODR=1 Hz
+
+    /* Lecture des 16 octets de calibration (0x30..0x3F) */
+    uint8_t c[16];
+    HTS221_ReadMulti(HTS221_CALIB_START, c, 16);
+
+    uint16_t T0_x8 = c[2] | ((uint16_t)(c[5] & 0x03) << 8);  // 10 bits
+    uint16_t T1_x8 = c[3] | ((uint16_t)(c[5] & 0x0C) << 6);
+    hts_H0_rH  = c[0] / 2.0f;
+    hts_H1_rH  = c[1] / 2.0f;
+    hts_T0_degC = T0_x8 / 8.0f;
+    hts_T1_degC = T1_x8 / 8.0f;
+    hts_H0_OUT = (int16_t)(c[6]  | (c[7]  << 8));
+    hts_H1_OUT = (int16_t)(c[10] | (c[11] << 8));
+    hts_T0_OUT = (int16_t)(c[12] | (c[13] << 8));
+    hts_T1_OUT = (int16_t)(c[14] | (c[15] << 8));
+}
+
+/* Renvoie la temperature (degC) et l'humidite relative (%) calibrees. */
+static void HTS221_Read_TH(float *temp_c, float *hum_pct) {
+    uint8_t d[4];
+    HTS221_ReadMulti(HTS221_HUM_OUT_L, d, 4);   // H_L,H_H,T_L,T_H
+    int16_t H_OUT = (int16_t)(d[0] | (d[1] << 8));
+    int16_t T_OUT = (int16_t)(d[2] | (d[3] << 8));
+
+    /* Interpolation lineaire entre les 2 points de calibration usine */
+    *hum_pct = hts_H0_rH + (float)(H_OUT - hts_H0_OUT) *
+               (hts_H1_rH - hts_H0_rH) / (float)(hts_H1_OUT - hts_H0_OUT);
+    *temp_c  = hts_T0_degC + (float)(T_OUT - hts_T0_OUT) *
+               (hts_T1_degC - hts_T0_degC) / (float)(hts_T1_OUT - hts_T0_OUT);
 }
 
 /* Affiche un temps en millisecondes sur le MAX7219 au format S.mmm (secondes).
@@ -269,28 +318,25 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_Delay(100);
-  printf("=== VertiSense Ready ===\r\n");
-  I2C_BusRecover();     /* diagnostic + deblocage du bus avant tout acces */
-  I2C_Scan();
+  printf("\r\n=== VertiSense - mesureur de saut ===\r\n");
+
+  I2C_BusRecover();     /* deblocage du bus I2C avant tout acces */
 
   MAX7219_Init();
   Display_Time(0);          // affiche 0.000 au demarrage
-
   HAL_TIM_Base_Start_IT(&htim6);
-  printf("TIM6 OK\r\n");
 
-  /* --- LSM6DSO : accelero + detection chute libre (INT1) / impact (INT2) --- */
+  /* --- Capteur 1 : LSM6DSO (accelerometre, detection de saut) --- */
   uint8_t who = LSM6DSO_Read(LSM6DSO_WHO_AM_I);
-  printf("[LSM6DSO] WHO_AM_I = 0x%02X (attendu 0x6C)\r\n", who);
+  printf("Capteur 1 - Accelerometre LSM6DSO : %s\r\n",
+         (who == 0x6C) ? "OK" : "ABSENT");
   LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x40);    // ODR 104 Hz, plage +/-2g
   LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);     // auto-increment des registres
-  LSM6DSO_Write(LSM6DSO_FREE_FALL, 0x33);   // seuil chute libre ~312 mg, duree ~58 ms
-  LSM6DSO_Write(LSM6DSO_WAKE_UP_THS, 0x08); // seuil impact = 8 x 62.5 mg = 500 mg
-  LSM6DSO_Write(LSM6DSO_WAKE_UP_DUR, 0x00);
-  LSM6DSO_Write(LSM6DSO_MD1_CFG, 0x10);     // chute libre -> INT1 (PB4)
-  LSM6DSO_Write(LSM6DSO_MD2_CFG, 0x20);     // wake-up (impact) -> INT2 (PB3)
-  LSM6DSO_Read(LSM6DSO_ALL_INT_SRC);        // purge des IT residuelles
-  printf("[LSM6DSO] Detection chute libre / impact armee\r\n");
+
+  /* --- Capteur 2 : HTS221 (temperature + humidite) --- */
+  HTS221_Init();
+
+  printf("Pret - saute !\r\n\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -303,23 +349,10 @@ int main(void)
 	  static AppState_t prev_state = APP_IDLE;
 	  static uint32_t   last_shown = 0xFFFFFFFF;
 
-	  /* --- Phase B2 : LSM6DSO integre a la state machine (voir EXTI3/EXTI4
-	     dans stm32l1xx_it.c) : le decollage/atterrissage demarre/arrete le
-	     chrono automatiquement, ces blocs ne servent plus qu'au log UART. --- */
-	  if (flag_takeoff) {
-	      flag_takeoff = 0;
-	      printf(">>> DECOLLAGE (chute libre) detecte ! <<<\r\n");
-	  }
-	  if (flag_landing) {
-	      flag_landing = 0;
-	      printf(">>> ATTERRISSAGE (impact) detecte ! <<<\r\n");
-	  }
-
-	  /* --- Echantillonnage accelero ~10 ms (aligne sur l'ODR 104 Hz) :
-	     sert a la fois a la detection de saut et au log UART (throttle 200 ms). --- */
+	  /* --- Echantillonnage accelero ~10 ms (aligne sur l'ODR 104 Hz),
+	     utilise par la detection de saut (|a| courant dans `mag`). --- */
 	  static uint32_t last_acc = 0;
-	  static uint32_t last_log = 0;
-	  static uint32_t mag = GRAVITY_MG;   // |a| courant, dispo pour la detection
+	  static uint32_t mag = GRAVITY_MG;
 	  if (HAL_GetTick() - last_acc >= 10) {
 	      last_acc = HAL_GetTick();
 	      int16_t ax, ay, az;
@@ -330,15 +363,48 @@ int main(void)
 	      int32_t mz = (int32_t)az * 61 / 1000;
 	      mag = (uint32_t)sqrtf((float)(mx*mx + my*my + mz*mz));
 
-	      /* log UART allege : une ligne toutes les 200 ms.
-	         DIAG : on affiche l'etat (0=IDLE 1=RUNNING 2=RESULT), tim_ms (TIM6)
-	         et t_start pour verifier que le chrono avance vraiment. */
-	      if (HAL_GetTick() - last_log >= 200) {
-	          last_log = HAL_GetTick();
-	          printf("A: |a|=%lu mg  S=%d tim=%lu tstart=%lu\r\n",
-	                 (unsigned long)mag, (int)state,
-	                 (unsigned long)tim_ms, (unsigned long)t_start);
+	      /* === Detection de saut (fenetre d'apesanteur + anti-rebond) ===
+	         low_since / high_since = instant (tim_ms) ou |a| est passe en
+	         continu sous FREEFALL / au dessus de LANDED. Remis a 0 des que la
+	         condition n'est plus vraie => un a-coup bref ne valide rien. */
+	      static uint32_t low_since  = 0;
+	      static uint32_t high_since = 0;
+	      if (mag < FREEFALL_MG) { if (!low_since)  low_since  = tim_ms; } else low_since  = 0;
+	      if (mag > LANDED_MG)   { if (!high_since) high_since = tim_ms; } else high_since = 0;
+
+	      if (state == APP_IDLE) {
+	          /* DECOLLAGE : apesanteur maintenue >= CONFIRM_MS.
+	             Le vol commence au debut de l'apesanteur (low_since). */
+	          if (low_since && (tim_ms - low_since) >= CONFIRM_MS) {
+	              t_start = low_since;
+	              state = APP_RUNNING;
+	          }
+	      } else if (state == APP_RUNNING) {
+	          uint32_t elapsed = tim_ms - t_start;
+	          /* ATTERRISSAGE : retour au sol maintenu >= CONFIRM_MS, apres un
+	             vrai vol. Le vol se termine au debut du retour au sol. */
+	          if (high_since && (tim_ms - high_since) >= CONFIRM_MS
+	                         && (high_since - t_start) >= AIRTIME_MIN_MS) {
+	              uint32_t air = high_since - t_start;
+	              if (air <= AIRTIME_MAX_MS) { hang_time = air; state = APP_RESULT; }
+	              else                        state = APP_IDLE;
+	          } else if (elapsed > AIRTIME_MAX_MS) {
+	              state = APP_IDLE;          /* jamais d'atterrissage franc */
+	          }
 	      }
+	  }
+
+	  /* --- 2e capteur : HTS221 temperature + humidite, toutes les 5 s.
+	     Uniquement au repos : ne jamais voler de temps I2C pendant un saut. --- */
+	  static uint32_t last_th = 0;
+	  if (state == APP_IDLE && HAL_GetTick() - last_th >= 5000) {
+	      last_th = HAL_GetTick();
+	      float t_c, h_p;
+	      HTS221_Read_TH(&t_c, &h_p);
+	      int t10 = (int)(t_c * 10.0f + 0.5f);   // dixiemes de degre
+	      int h10 = (int)(h_p * 10.0f + 0.5f);   // dixiemes de %
+	      printf("[HTS221] T=%d.%d C   H=%d.%d %%rH\r\n",
+	             t10 / 10, t10 % 10, h10 / 10, h10 % 10);
 	  }
 
 	  /* Etat reellement traite a cette iteration : sert a detecter l'entree
@@ -350,47 +416,17 @@ int main(void)
 
 	  case APP_IDLE:
 	      if (prev_state != APP_IDLE) {
-	          printf("IDLE - Saute (ou BP1) pour demarrer\r\n");
 	          Display_Time(0);
 	          last_shown = 0;
-	      }
-	      /* Detection DECOLLAGE : |a| chute sous le seuil de chute libre */
-	      if (mag < FREEFALL_MG) {
-	          t_start = tim_ms;
-	          state = APP_RUNNING;
-	          printf(">> TAKEOFF  mag=%lu  t_start=%lu (tim_ms)\r\n",
-	                 (unsigned long)mag, (unsigned long)t_start);
 	      }
 	      break;
 
 	  case APP_RUNNING:
-	      if (prev_state != APP_RUNNING) {
-	          printf("RUNNING - en l'air...\r\n");
-	      }
 	      {
 	          uint32_t elapsed = tim_ms - t_start;   // temps ecoule en ms
 	          if (elapsed != last_shown) {
 	              Display_Time(elapsed);             // mise a jour en direct
 	              last_shown = elapsed;
-	          }
-	          /* Detection ATTERRISSAGE : pic d'acceleration (impact) */
-	          if (mag > IMPACT_MG) {
-	              uint32_t air = tim_ms - t_start;
-	              printf(">> LANDING  mag=%lu  air=%lu ms\r\n",
-	                     (unsigned long)mag, (unsigned long)air);
-	              if (air >= AIRTIME_MIN_MS && air <= AIRTIME_MAX_MS) {
-	                  hang_time = air;               // temps en l'air valide
-	                  state = APP_RESULT;
-	              } else {
-	                  /* trop court/trop long => faux declenchement, on annule */
-	                  printf("(faux declenchement : %lu ms ignore)\r\n",
-	                         (unsigned long)air);
-	                  state = APP_IDLE;
-	              }
-	          } else if (elapsed > AIRTIME_MAX_MS) {
-	              /* jamais d'impact detecte => on abandonne la mesure */
-	              printf("(timeout : pas d'impact detecte)\r\n");
-	              state = APP_IDLE;
 	          }
 	      }
 	      break;
@@ -403,15 +439,16 @@ int main(void)
 	             En cm : h_cm = 9.81 * (t_ms/1000)^2 / 8 * 100 */
 	          float t_s  = hang_time / 1000.0f;
 	          float h_cm = 9.81f * t_s * t_s / 8.0f * 100.0f;
-	          printf("=== Temps en l'air : %lu ms  ->  hauteur : %d.%d cm ===\r\n",
-	                 (unsigned long)hang_time,
-	                 (int)h_cm, (int)(h_cm * 10.0f + 0.5f) % 10);
+	          int h10 = (int)(h_cm * 10.0f + 0.5f);   // hauteur en dixiemes de cm
+	          printf("Saut : %lu ms en l'air  ->  %d.%d cm\r\n",
+	                 (unsigned long)hang_time, h10 / 10, h10 % 10);
 	          /* Alterne HAUTEUR (resultat principal) et TEMPS en l'air, en
 	             terminant sur la hauteur. Formats distincts a l'ecran :
 	             hauteur "42.7" (digit gauche eteint), temps "0.590". */
 	          Display_Height(h_cm);   HAL_Delay(2000);
 	          Display_Time(hang_time); HAL_Delay(2000);
 	          Display_Height(h_cm);   HAL_Delay(2000);
+	          printf("Pret - saute !\r\n");
 	          state = APP_IDLE;
 	      }
 	      break;
