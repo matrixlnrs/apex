@@ -1,0 +1,51 @@
+stages:
+  - quality
+  - build
+
+cppcheck:
+  stage: quality
+  image: ubuntu:24.04
+  before_script:
+    - apt-get update
+    - apt-get install -y cppcheck python3-pip
+    - pip3 install cppcheck-codequality --break-system-packages
+  script:
+    - cppcheck --enable=warning,style,performance,portability
+        --inline-suppr --suppress=missingInclude
+        --xml Core/Src 2> cppcheck.xml
+    - cppcheck-codequality -i cppcheck.xml -o gl-code-quality-report.json
+    - cppcheck --enable=warning --error-exitcode=1
+        --inline-suppr --suppress=missingInclude Core/Src
+  artifacts:
+    when: always
+    reports:
+      codequality: gl-code-quality-report.json
+    paths:
+      - gl-code-quality-report.json
+
+clang-format:
+  stage: quality
+  image: ubuntu:24.04
+  allow_failure: true
+  before_script:
+    - apt-get update
+    - apt-get install -y clang-format
+  script:
+    - clang-format --dry-run --Werror Core/Src/*.c Core/Inc/*.h
+
+build-firmware:
+  stage: build
+  needs:
+    - cppcheck
+    - clang-format
+  image: ubuntu:24.04
+  before_script:
+    - apt-get update
+    - apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi make
+  script:
+    - make
+  artifacts:
+    paths:
+      - build/*.elf
+      - build/*.bin
+    expire_in: 1 week
