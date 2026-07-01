@@ -21,6 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <math.h>
+#include "max7219_Yncrea2.h"
 
 /* USER CODE END Includes */
 
@@ -31,7 +34,18 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+/* LSM6DSO (accelerometre) - adresse I2C 8 bits (deja decalee pour HAL) */
+#define LSM6DSO_ADDR      0xD6
+#define LSM6DSO_WHO_AM_I  0x0F   /* doit valoir 0x6C */
+#define LSM6DSO_CTRL1_XL  0x10   /* config accelero (ODR + plage) */
+#define LSM6DSO_CTRL3_C   0x12   /* auto-increment registres */
+#define LSM6DSO_OUTX_L_A  0x28   /* debut des 6 octets X/Y/Z */
+#define LSM6DSO_WAKE_UP_THS 0x5B /* seuil wake-up (impact) */
+#define LSM6DSO_WAKE_UP_DUR 0x5C
+#define LSM6DSO_FREE_FALL   0x5D /* seuil + duree chute libre */
+#define LSM6DSO_MD1_CFG     0x5E /* routage vers INT1 */
+#define LSM6DSO_MD2_CFG     0x5F /* routage vers INT2 */
+#define LSM6DSO_ALL_INT_SRC 0x1A /* lecture pour acquitter les IT */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,6 +65,13 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+volatile AppState_t state   = APP_IDLE;
+volatile uint32_t   t_start = 0;
+volatile uint32_t   hang_time = 0;
+
+/* Phase B1 : flags leves par les ISR LSM6DSO (validation detection) */
+volatile uint8_t flag_takeoff = 0;   /* INT1 : chute libre (decollage) */
+volatile uint8_t flag_landing = 0;   /* INT2 : impact (atterrissage) */
 
 /* USER CODE END PV */
 
@@ -68,7 +89,64 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+int __io_putchar(int ch) {
+    HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, 10);
+    return ch;
+}
 
+static void I2C_Scan(void) {
+    printf("--- Scan I2C ---\r\n");
+    for (uint8_t addr = 1; addr < 128; addr++) {
+        if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 1, 10) == HAL_OK) {
+            printf("Trouve : 0x%02X\r\n", addr << 1);
+        }
+    }
+    printf("--- Fin scan ---\r\n");
+}
+
+volatile uint32_t tim_ms = 0;
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM6) {
+        tim_ms++;
+    }
+}
+
+/* ===== LSM6DSO : acces I2C ===== */
+static void LSM6DSO_Write(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = {reg, val};
+    HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, buf, 2, 10);
+}
+
+static uint8_t LSM6DSO_Read(uint8_t reg) {
+    uint8_t val = 0;
+    HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, &val, 1, 10);
+    return val;
+}
+
+/* Lit les 3 axes accelero (raw, LSB). Auto-increment active via CTRL3_C. */
+static void LSM6DSO_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az) {
+    uint8_t reg = LSM6DSO_OUTX_L_A;
+    uint8_t d[6];
+    HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, d, 6, 10);
+    *ax = (int16_t)(d[1] << 8 | d[0]);
+    *ay = (int16_t)(d[3] << 8 | d[2]);
+    *az = (int16_t)(d[5] << 8 | d[4]);
+}
+
+/* Affiche un temps en millisecondes sur le MAX7219 au format S.mmm (secondes).
+   Digit 1 = gauche ... digit 4 = droite sur ce module. */
+static void Display_Time(uint32_t ms) {
+    uint32_t sec  = ms / 1000;   // partie secondes
+    uint32_t frac = ms % 1000;   // partie millisecondes (000-999)
+
+    MAX7219_DisplayCharDP(1, '0' + (sec % 10), 1);      // secondes (unites) + point, a GAUCHE
+    MAX7219_DisplayChar(2, '0' + (frac / 100) % 10);    // millisecondes (centaines)
+    MAX7219_DisplayChar(3, '0' + (frac / 10) % 10);     // millisecondes (dizaines)
+    MAX7219_DisplayChar(4, '0' + (frac % 10));          // millisecondes (unites), a DROITE
+}
 /* USER CODE END 0 */
 
 /**
@@ -106,7 +184,28 @@ int main(void)
   MX_TIM6_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_Delay(100);
+  printf("=== VertiSense Ready ===\r\n");
+  I2C_Scan();
 
+  MAX7219_Init();
+  Display_Time(0);          // affiche 0.000 au demarrage
+
+  HAL_TIM_Base_Start_IT(&htim6);
+  printf("TIM6 OK\r\n");
+
+  /* --- LSM6DSO : accelero + detection chute libre (INT1) / impact (INT2) --- */
+  uint8_t who = LSM6DSO_Read(LSM6DSO_WHO_AM_I);
+  printf("[LSM6DSO] WHO_AM_I = 0x%02X (attendu 0x6C)\r\n", who);
+  LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x40);    // ODR 104 Hz, plage +/-2g
+  LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);     // auto-increment des registres
+  LSM6DSO_Write(LSM6DSO_FREE_FALL, 0x33);   // seuil chute libre ~312 mg, duree ~58 ms
+  LSM6DSO_Write(LSM6DSO_WAKE_UP_THS, 0x08); // seuil impact = 8 x 62.5 mg = 500 mg
+  LSM6DSO_Write(LSM6DSO_WAKE_UP_DUR, 0x00);
+  LSM6DSO_Write(LSM6DSO_MD1_CFG, 0x10);     // chute libre -> INT1 (PB4)
+  LSM6DSO_Write(LSM6DSO_MD2_CFG, 0x20);     // wake-up (impact) -> INT2 (PB3)
+  LSM6DSO_Read(LSM6DSO_ALL_INT_SRC);        // purge des IT residuelles
+  printf("[LSM6DSO] Detection chute libre / impact armee\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -116,6 +215,68 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  static AppState_t prev_state = APP_IDLE;
+	  static uint32_t   last_shown = 0xFFFFFFFF;
+
+	  /* --- Phase B1 : validation des interruptions LSM6DSO --- */
+	  if (flag_takeoff) {
+	      flag_takeoff = 0;
+	      printf(">>> DECOLLAGE (chute libre) detecte ! <<<\r\n");
+	  }
+	  if (flag_landing) {
+	      flag_landing = 0;
+	      printf(">>> ATTERRISSAGE (impact) detecte ! <<<\r\n");
+	  }
+
+	  /* --- Phase A : lecture accelero toutes les 200 ms (UART) --- */
+	  static uint32_t last_acc = 0;
+	  if (HAL_GetTick() - last_acc >= 200) {
+	      last_acc = HAL_GetTick();
+	      int16_t ax, ay, az;
+	      LSM6DSO_ReadAccel(&ax, &ay, &az);
+	      /* conversion en mg : 0.061 mg/LSB a +/-2g */
+	      int32_t mx = (int32_t)ax * 61 / 1000;
+	      int32_t my = (int32_t)ay * 61 / 1000;
+	      int32_t mz = (int32_t)az * 61 / 1000;
+	      uint32_t mag = (uint32_t)sqrtf((float)(mx*mx + my*my + mz*mz));
+	      printf("A: X=%ld Y=%ld Z=%ld  |a|=%lu mg\r\n",
+	             (long)mx, (long)my, (long)mz, (unsigned long)mag);
+	  }
+
+	  switch (state) {
+
+	  case APP_IDLE:
+	      if (prev_state != APP_IDLE) {
+	          printf("IDLE - Appuie BP1 pour demarrer\r\n");
+	          Display_Time(0);
+	          last_shown = 0;
+	      }
+	      break;
+
+	  case APP_RUNNING:
+	      if (prev_state != APP_RUNNING) {
+	          printf("RUNNING - Appuie BP2 pour arreter\r\n");
+	      }
+	      {
+	          uint32_t elapsed = tim_ms - t_start;   // temps ecoule en ms
+	          if (elapsed != last_shown) {
+	              Display_Time(elapsed);             // mise a jour en direct
+	              last_shown = elapsed;
+	          }
+	      }
+	      break;
+
+	  case APP_RESULT:
+	      if (prev_state != APP_RESULT) {
+	          printf("Temps : %lu ms\r\n", hang_time);
+	          Display_Time(hang_time);               // fige le resultat final
+	          HAL_Delay(3000);
+	          state = APP_IDLE;
+	      }
+	      break;
+	  }
+
+	  prev_state = state;
   }
   /* USER CODE END 3 */
 }
@@ -308,9 +469,9 @@ static void MX_TIM6_Init(void)
 
   /* USER CODE END TIM6_Init 1 */
   htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 31999;
+  htim6.Init.Prescaler = 31;      /* 32 MHz / (31+1) = 1 MHz */
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim6.Init.Period = 0;
+  htim6.Init.Period = 999;        /* 1 MHz / (999+1) = 1 kHz -> IRQ toutes les 1 ms */
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
   {
@@ -389,7 +550,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : LED0_Pin LED1_Pin LED2_Pin LED3_Pin
@@ -408,23 +569,35 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(SPI_CS_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : BP1_Pin */
-  GPIO_InitStruct.Pin = BP1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  /*Configure GPIO pins : BP1_Pin BP2_Pin */
+  GPIO_InitStruct.Pin = BP1_Pin|BP2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(BP1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : BP2_Pin */
-  GPIO_InitStruct.Pin = BP2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(BP2_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Boutons BP1/BP2 : actifs haut sur cette carte -> front MONTANT, pas de pull
+     interne (pull-down externe present). Aligne sur le TP2_INTERRUPTIONS. */
+  GPIO_InitStruct.Pin  = BP1_Pin | BP2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* LSM6DSO INT1 (PB4, decollage) et INT2 (PB3, atterrissage) : front montant.
+     PB3 etait le SWO -> reaffecte en EXTI (on garde le debug SWD PA13/PA14). */
+  GPIO_InitStruct.Pin  = LSM_INT1_Pin | LSM_INT2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+  HAL_NVIC_SetPriority(EXTI3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }

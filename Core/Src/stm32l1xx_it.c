@@ -22,6 +22,7 @@
 #include "stm32l1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,6 +58,14 @@
 /* External variables --------------------------------------------------------*/
 extern TIM_HandleTypeDef htim6;
 /* USER CODE BEGIN EV */
+extern volatile uint32_t tim_ms;
+
+extern volatile AppState_t state;
+extern volatile uint32_t t_start;
+extern volatile uint32_t hang_time;
+
+extern volatile uint8_t flag_takeoff;   /* INT1 LSM6DSO : chute libre */
+extern volatile uint8_t flag_landing;   /* INT2 LSM6DSO : impact */
 
 /* USER CODE END EV */
 
@@ -199,11 +208,58 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief This function handles EXTI line3 interrupt (LSM6DSO INT2 = impact/atterrissage).
+  */
+void EXTI3_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI3_IRQn 0 */
+	flag_landing = 1;
+  /* USER CODE END EXTI3_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(LSM_INT2_Pin);
+  /* USER CODE BEGIN EXTI3_IRQn 1 */
+
+  /* USER CODE END EXTI3_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI line4 interrupt (LSM6DSO INT1 = chute libre/decollage).
+  */
+void EXTI4_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI4_IRQn 0 */
+	flag_takeoff = 1;
+  /* USER CODE END EXTI4_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(LSM_INT1_Pin);
+  /* USER CODE BEGIN EXTI4_IRQn 1 */
+
+  /* USER CODE END EXTI4_IRQn 1 */
+}
+
+/**
   * @brief This function handles EXTI line[15:10] interrupts.
   */
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
+	// Anti-rebond base sur SysTick (HAL_GetTick, toujours actif, independant de TIM6)
+	static uint32_t last_bp1 = 0;
+	static uint32_t last_bp2 = 0;
+	uint32_t now = HAL_GetTick();
+
+	if (__HAL_GPIO_EXTI_GET_IT(BP1_Pin)) {
+	    if (state == APP_IDLE && (now - last_bp1) > 50) {
+	        t_start = tim_ms;
+	        state = APP_RUNNING;
+	    }
+	    last_bp1 = now;
+	}
+	if (__HAL_GPIO_EXTI_GET_IT(BP2_Pin)) {
+	    if (state == APP_RUNNING && (now - last_bp2) > 50) {
+	        hang_time = tim_ms - t_start;
+	        state = APP_RESULT;
+	    }
+	    last_bp2 = now;
+	}
 
   /* USER CODE END EXTI15_10_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(BP1_Pin);

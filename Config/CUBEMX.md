@@ -104,12 +104,14 @@ Onglet **Parameter Settings** :
 
 | Paramètre | Valeur |
 |---|---|
-| Prescaler (PSC) | **31999** |
+| Prescaler (PSC) | **31** |
 | Counter Mode | **Up** |
-| Counter Period (ARR) | **0** |
+| Counter Period (ARR) | **999** |
 | auto-reload preload | **Disable** |
 
-> Explication : 32 MHz / 32000 = 1000 Hz → IRQ toutes les **1 ms**.
+> Explication : 32 MHz / (31+1) = 1 MHz, puis 1 MHz / (999+1) = 1000 Hz → IRQ toutes les **1 ms**.
+> ⚠️ **NE PAS mettre ARR = 0** : avec ARR=0 le TIM6 ne génère pas d'IRQ de mise à jour
+> fiable, `tim_ms` reste bloqué à 0 et toute la state machine (BP1/BP2) est cassée.
 > TIM6 n'a pas de broche externe — il n'apparaîtra pas sur le schéma du chip, c'est normal.
 
 Onglet **NVIC Settings** :
@@ -161,17 +163,20 @@ Pour régler le Pull-up de PA8 :
 
 | Broche | Label | Mode | Pull | Trigger |
 |---|---|---|---|---|
-| PA11 | `BP1` | `GPIO_EXTI11` | **Pull-up** | **Falling Edge** |
-| PA12 | `BP2` | `GPIO_EXTI12` | **Pull-up** | **Falling Edge** |
+| PA11 | `BP1` | `GPIO_EXTI11` | **No pull** | **Rising Edge** |
+| PA12 | `BP2` | `GPIO_EXTI12` | **No pull** | **Rising Edge** |
 
-> BP1 = armer le système (IT 1)
-> BP2 = remettre à zéro (IT 2)
-> Falling Edge car les boutons ISEN32 sont actifs bas (appui = LOW)
+> BP1 = démarrer le chrono
+> BP2 = arrêter le chrono
+> **Rising Edge + No pull** pour coller au TP2_INTERRUPTIONS (référence qui marche
+> sur cette carte : BTN1/BTN2 y sont en RISING + NOPULL, donc actifs HAUT).
+> ⚠️ Polarité à confirmer sur le matériel : si l'appui ne déclenche rien après avoir
+> corrigé TIM6 (voir ÉTAPE 6), tester l'autre polarité (Falling + Pull-up).
 
 Pour régler le mode et le trigger :
 `System Core` → `GPIO` → trouve la broche
-→ GPIO mode = `External Interrupt with Falling edge trigger detection`
-→ GPIO Pull-up/Pull-down = `Pull-up`
+→ GPIO mode = `External Interrupt with Rising edge trigger detection`
+→ GPIO Pull-up/Pull-down = `No pull-up and no pull-down`
 
 ---
 

@@ -36,6 +36,12 @@ extern "C" {
 
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
+typedef enum {
+    APP_IDLE    = 0,
+    APP_RUNNING = 1,
+    APP_RESULT  = 2
+} AppState_t;
+
 
 /* USER CODE END ET */
 
@@ -92,8 +98,13 @@ void Error_Handler(void);
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
 #define TCK_GPIO_Port GPIOA
-#define SWO_Pin GPIO_PIN_3
-#define SWO_GPIO_Port GPIOB
+/* LSM6DSO interruptions (ex-SWO PB3 libere) */
+#define LSM_INT1_Pin GPIO_PIN_4
+#define LSM_INT1_GPIO_Port GPIOB
+#define LSM_INT1_EXTI_IRQn EXTI4_IRQn
+#define LSM_INT2_Pin GPIO_PIN_3
+#define LSM_INT2_GPIO_Port GPIOB
+#define LSM_INT2_EXTI_IRQn EXTI3_IRQn
 
 /* USER CODE BEGIN Private defines */
 
