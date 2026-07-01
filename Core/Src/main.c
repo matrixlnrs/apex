@@ -84,9 +84,14 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+TIM_HandleTypeDef htim3;                  /* PWM moteur (TIM3_CH1 sur PB4) */
+
 volatile AppState_t state   = APP_IDLE;   /* etat de la mesure de saut */
 volatile uint32_t   t_start = 0;          /* tim_ms au decollage */
 volatile uint32_t   hang_time = 0;        /* temps en l'air mesure (ms) */
+
+#define MOTOR_ARR   999   /* periode PWM moteur : 1 MHz / 1000 = 1 kHz */
+#define MOTOR_DUTY  800   /* vitesse en vol : 800/999 ~ 80 % */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -98,7 +103,7 @@ static void MX_SPI1_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void MX_TIM3_Init(void);           /* moteur PWM, config manuelle (hors CubeMX) */
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -317,6 +322,7 @@ int main(void)
   MX_TIM6_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  MX_TIM3_Init();           /* moteur PWM (config manuelle, hors CubeMX) */
   HAL_Delay(100);
   printf("\r\n=== VertiSense - mesureur de saut ===\r\n");
 
@@ -325,6 +331,7 @@ int main(void)
   MAX7219_Init();
   Display_Time(0);          // affiche 0.000 au demarrage
   HAL_TIM_Base_Start_IT(&htim6);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);   /* PWM moteur actif (duty 0 = arret) */
 
   /* --- Capteur 1 : LSM6DSO (accelerometre, detection de saut) --- */
   uint8_t who = LSM6DSO_Read(LSM6DSO_WHO_AM_I);
@@ -378,6 +385,7 @@ int main(void)
 	          if (low_since && (tim_ms - low_since) >= CONFIRM_MS) {
 	              t_start = low_since;
 	              state = APP_RUNNING;
+	              __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, MOTOR_DUTY);  // moteur ON en vol
 	          }
 	      } else if (state == APP_RUNNING) {
 	          uint32_t elapsed = tim_ms - t_start;
@@ -388,8 +396,10 @@ int main(void)
 	              uint32_t air = high_since - t_start;
 	              if (air <= AIRTIME_MAX_MS) { hang_time = air; state = APP_RESULT; }
 	              else                        state = APP_IDLE;
+	              __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);           // moteur OFF a l'atterrissage
 	          } else if (elapsed > AIRTIME_MAX_MS) {
 	              state = APP_IDLE;          /* jamais d'atterrissage franc */
+	              __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);           // securite : moteur OFF
 	          }
 	      }
 	  }
@@ -667,6 +677,52 @@ static void MX_TIM6_Init(void)
 
 }
 
+/* USER CODE BEGIN 4_TIM3 */
+/**
+  * @brief TIM3 (PWM moteur) - configuration manuelle, hors CubeMX.
+  *        Sortie CH1 sur PB4 (AF2). PWM ~1 kHz, duty pilote la vitesse.
+  */
+static void MX_TIM3_Init(void)
+{
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  GPIO_InitTypeDef   GPIO_InitStruct = {0};
+
+  /* Horloges : TIM3 (bus APB1) et GPIOB (broche moteur PB4) */
+  __HAL_RCC_TIM3_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /* PB4 -> TIM3_CH1 en fonction alternative (AF2) */
+  GPIO_InitStruct.Pin       = GPIO_PIN_4;
+  GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull      = GPIO_NOPULL;
+  GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Alternate = GPIO_AF2_TIM3;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* Base de temps : 32 MHz / (31+1) = 1 MHz, ARR=999 -> PWM a 1 kHz */
+  htim3.Instance           = TIM3;
+  htim3.Init.Prescaler     = 31;
+  htim3.Init.CounterMode   = TIM_COUNTERMODE_UP;
+  htim3.Init.Period        = MOTOR_ARR;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_PWM_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /* Canal 1 : PWM mode 1, moteur a l'arret au depart (Pulse = 0) */
+  sConfigOC.OCMode     = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse      = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim3, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+/* USER CODE END 4_TIM3 */
+
 /**
   * @brief USART2 Initialization Function
   * @param None
@@ -765,17 +821,9 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* LSM6DSO INT1 (PB4, decollage) et INT2 (PB3, atterrissage) : front montant.
-     PB3 etait le SWO -> reaffecte en EXTI (on garde le debug SWD PA13/PA14). */
-  GPIO_InitStruct.Pin  = LSM_INT1_Pin | LSM_INT2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
-  HAL_NVIC_SetPriority(EXTI3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+  /* NOTE : PB4 (ex-LSM_INT1) est desormais reaffecte au MOTEUR (TIM3_CH1, PWM),
+     voir MX_TIM3_Init(). On ne configure donc plus PB4/PB3 en EXTI, et on
+     laisse EXTI3/EXTI4 desactives (detection de saut = 100% logicielle). */
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
