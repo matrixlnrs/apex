@@ -1,0 +1,5 @@
+Julien:
+
+SLIDE 1 (1min30) • APEX = point le plus haut d'une trajectoire • Montrer la courbe : décollage → apogée → réception • Le boîtier ne voit RIEN (ni sol, ni corps) → pourtant affiche la hauteur • Annonce plan : physique + STM32 + enquête de debug en 3 acte
+
+SLIDE 4 — ENQUÊTE DEBUG (4min30) ← MOMENT FORT, ton narratif AFFAIRE 1 — LE FAUX COUPABLE • Symptôme : boutons muets → on vérifie pull-up, anti-rebond... innocents ! • Vrai coupable : ARR=0 → compteur ms FIGÉ → anti-rebond dépendait du temps • Leçon : le symptôme n'est jamais là où est la cause  AFFAIRE 2 — L'ADRESSE FANTÔME • Symptôme : scan I2C vide (127 adresses, silence total) • Alim OK, connexions OK, config OK...  • Coupable : firmware sur PB6/PB7, shield sur PB8/PB9 → "on criait dans une pièce vide" • Leçon : lire le schéma du SHIELD, pas juste la datasheet MCU  AFFAIRE 3 — L'INSTANT MANQUÉ • Symptôme : détection 1 saut sur 3 → démo impossible • UART révèle : échantillonnage 10 ms trop lent → rate creux + pic • Fix : 416 Hz + lecture chaque tour + afficheur figé pendant vol • Leçon/méthode : ISOLER, MESURER, PROUVER — printf = stéthoscope

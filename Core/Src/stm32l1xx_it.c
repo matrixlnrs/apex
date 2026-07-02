@@ -210,7 +210,7 @@ void SysTick_Handler(void)
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
-	// Anti-rebond base sur SysTick (HAL_GetTick, toujours actif, independant de TIM6)
+	// anti-rebond 50 ms sur chaque bouton
 	static uint32_t last_bp1 = 0;
 	static uint32_t last_bp2 = 0;
 	uint32_t now = HAL_GetTick();
