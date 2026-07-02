@@ -1,0 +1,21 @@
+# Sortie de build STM32CubeIDE (regénérée à chaque compilation)
+/Debug/
+/Release/
+
+# Métadonnées du workspace Eclipse / STM32CubeIDE (spécifiques à chaque machine)
+/.metadata/
+
+# Artefacts de compilation épars
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.list
+*.map
+*.bin
+*.hex
+
+# macOS
+.DS_Store
+**/.DS_Store

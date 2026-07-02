@@ -306,17 +306,13 @@ static void Display_Humidity(uint8_t h) {
     MAX7219_DisplayChar(4, '0' + h % 10);
 }
 
-/* DIAG : derniers raw/status ADC, pour verifier si le potentiometre bouge. */
-static uint16_t g_adc_raw = 0;
-static HAL_StatusTypeDef g_adc_st = HAL_OK;
-
 /* Lit le potentiometre RV1 (PA0) et le convertit en objectif 0..GOAL_MAX_CM. */
 static uint16_t ADC_ReadGoal_cm(void) {
     HAL_ADC_Start(&hadc);
-    g_adc_st  = HAL_ADC_PollForConversion(&hadc, 100);
-    g_adc_raw = (uint16_t)HAL_ADC_GetValue(&hadc);   // 0..4095 (12 bits)
+    HAL_ADC_PollForConversion(&hadc, 100);
+    uint32_t raw = HAL_ADC_GetValue(&hadc);   // 0..4095 (12 bits)
     HAL_ADC_Stop(&hadc);
-    return (uint16_t)(((uint32_t)g_adc_raw * GOAL_MAX_CM) / 4095UL);
+    return (uint16_t)((raw * GOAL_MAX_CM) / 4095UL);
 }
 
 /* Fait vibrer le moteur (PB4) n fois : ON 200 ms / OFF 150 ms. */
@@ -444,16 +440,6 @@ int main(void)
 	      if (goal_cm != last_goal) {            // rafraichit l'ecran seulement si ca change
 	          Display_Goal(goal_cm);
 	          last_goal = goal_cm;
-	      }
-	      /* DIAG ADC : affiche la valeur brute toutes les 300 ms. Tourne RV1 et
-	         observe 'raw' : s'il ne bouge pas, le potentiometre n'atteint pas PA0. */
-	      {
-	          static uint32_t last_adc_log = 0;
-	          if (HAL_GetTick() - last_adc_log >= 300) {
-	              last_adc_log = HAL_GetTick();
-	              printf("[ADC] raw=%u  st=%d  goal=%u cm\r\n",
-	                     g_adc_raw, (int)g_adc_st, goal_cm);
-	          }
 	      }
 	      if (Button_Pressed(BTN3_GPIO_Port, BTN3_Pin, &b3_down) ||
 	          Button_Pressed(BTN4_GPIO_Port, BTN4_Pin, &b4_down)) {
