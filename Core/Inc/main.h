@@ -99,7 +99,7 @@ void Error_Handler(void);
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
 #define TCK_GPIO_Port GPIOA
-/* Moteur de vibration : pilote via PB4 (ex-TIM3_CH1 du TP04), utilise en GPIO */
+/* Moteur de vibration sur PB4 */
 #define MOTOR_Pin GPIO_PIN_4
 #define MOTOR_GPIO_Port GPIOB
 /* Boutons de validation objectif (carte ISEN32, GPIOC) */

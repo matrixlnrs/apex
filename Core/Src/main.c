@@ -49,14 +49,14 @@
 #define HTS221_H1_OUT_L   0x3A
 #define HTS221_HUM_OUT_L  0x28   /* mesure d'humidite brute */
 
-/* --- Detection de saut par seuils logiciels sur |a| (en mg) --- */
-#define FREEFALL_MG     300   /* |a| sous ce seuil = chute libre => decollage */
-#define IMPACT_MG      1800   /* |a| au dessus de ce seuil = impact => atterrissage */
-#define AIRTIME_MIN_MS   80   /* rejette les faux declenchements (bruit) */
-#define AIRTIME_MAX_MS 2000   /* garde-fou : au dela on annule la mesure */
-#define GRAVITY_MG     1000   /* 1 g de reference */
-#define FF_CONFIRM_MS    15   /* chute libre confirmee si |a| reste bas >= ce temps */
-#define GOAL_MAX_CM      99   /* objectif max (potentiometre a fond) */
+/* Seuils de detection du saut (en mg, 1000 mg = 1 g) */
+#define FREEFALL_MG     300   /* en dessous : chute libre (decollage) */
+#define IMPACT_MG      1800   /* au dessus : impact (atterrissage) */
+#define AIRTIME_MIN_MS   80   /* temps de vol minimum accepte */
+#define AIRTIME_MAX_MS 2000   /* temps de vol maximum accepte */
+#define GRAVITY_MG     1000
+#define FF_CONFIRM_MS    15   /* duree mini sous le seuil pour valider la chute libre */
+#define GOAL_MAX_CM      99   /* objectif quand le potentiometre est a fond */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -102,19 +102,16 @@ int __io_putchar(int ch) {
     return ch;
 }
 
-/* DIAG + RECUPERATION du bus I2C1 (PB8=SCL, PB9=SDA).
-   A appeler AVANT toute transaction I2C. Lit l'etat des lignes au repos :
-   une ligne a 0 au repos => bus bloque (esclave coince, pull-up absent, ou
-   carte non alimentee). Puis genere jusqu'a 9 impulsions d'horloge sur SCL
-   pour liberer un esclave qui tient SDA bas, suivies d'un STOP manuel. */
+/* Debloque le bus I2C si un capteur est reste coince apres un reset
+   (SDA bloque a 0) : on envoie des coups d'horloge sur SCL jusqu'a ce
+   qu'il relache la ligne, puis on reinitialise le peripherique I2C. */
 static void I2C_BusRecover(void) {
     GPIO_InitTypeDef g = {0};
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* Coupe le peripherique I2C pour reprendre la main sur les broches */
     HAL_I2C_DeInit(&hi2c1);
 
-    /* PB8/PB9 en open-drain GPIO avec pull-up, niveau haut (relache) */
+    /* PB8/PB9 repris en GPIO open-drain le temps de la manoeuvre */
     g.Pin   = GPIO_PIN_8 | GPIO_PIN_9;
     g.Mode  = GPIO_MODE_OUTPUT_OD;
     g.Pull  = GPIO_PULLUP;
@@ -125,15 +122,16 @@ static void I2C_BusRecover(void) {
 
     int sda = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
 
-    if (sda == 0) {   /* SDA tenu bas => un esclave est coince, on genere des clocks */
+    if (sda == 0) {
+        /* jusqu'a 9 impulsions d'horloge pour liberer SDA */
         for (int i = 0; i < 9; i++) {
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
             HAL_Delay(1);
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
             HAL_Delay(1);
-            if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == 1) break;  /* SDA relache */
+            if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9) == 1) break;
         }
-        /* Condition de STOP : SDA passe de 0 a 1 pendant que SCL est haut */
+        /* condition de STOP pour finir proprement */
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
         HAL_Delay(1);
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
@@ -142,7 +140,6 @@ static void I2C_BusRecover(void) {
         HAL_Delay(1);
     }
 
-    /* Remet le peripherique I2C en service (reconfigure PB8/PB9 en AF) */
     MX_I2C1_Init();
 }
 
@@ -154,13 +151,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     }
 }
 
-/* ===== LSM6DSO : acces I2C ===== */
+/* --- LSM6DSO (accelerometre) --- */
 static void LSM6DSO_Write(uint8_t reg, uint8_t val) {
     uint8_t buf[2] = {reg, val};
     HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, buf, 2, 10);
 }
 
-/* Lit les 3 axes accelero (raw, LSB). Auto-increment active via CTRL3_C. */
+/* Lit les 3 axes d'un coup (6 octets, auto-increment active dans CTRL3_C) */
 static void LSM6DSO_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az) {
     uint8_t reg = LSM6DSO_OUTX_L_A;
     uint8_t d[6];
@@ -171,8 +168,8 @@ static void LSM6DSO_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az) {
     *az = (int16_t)(d[5] << 8 | d[4]);
 }
 
-/* ===== HTS221 : humidite (2eme capteur) ===== */
-static int16_t hts_h0_out = 0, hts_h1_out = 0;   /* coefficients de calibration */
+/* --- HTS221 (humidite) --- */
+static int16_t hts_h0_out = 0, hts_h1_out = 0;   /* calibration usine */
 static uint8_t hts_h0_rh  = 0, hts_h1_rh  = 0;
 
 static void HTS221_Write(uint8_t reg, uint8_t val) {
@@ -187,7 +184,7 @@ static uint8_t HTS221_Read(uint8_t reg) {
     return val;
 }
 
-/* Lit les coefficients de calibration usine (une fois au demarrage) */
+/* Coefficients de calibration, lus une fois au demarrage */
 static void HTS221_ReadCalibration(void) {
     hts_h0_rh = HTS221_Read(HTS221_H0_RH_X2) >> 1;
     hts_h1_rh = HTS221_Read(HTS221_H1_RH_X2) >> 1;
@@ -205,7 +202,7 @@ static void HTS221_Init(void) {
     HTS221_ReadCalibration();
 }
 
-/* Renvoie l'humidite relative en %% (0-100), interpolee via la calibration usine */
+/* Humidite relative en % (interpolation lineaire avec la calibration) */
 static uint8_t HTS221_ReadHumidity(void) {
     uint8_t lo = HTS221_Read(HTS221_HUM_OUT_L);
     uint8_t hi = HTS221_Read(HTS221_HUM_OUT_L + 1);
@@ -218,41 +215,37 @@ static uint8_t HTS221_ReadHumidity(void) {
     return (uint8_t)hum;
 }
 
-/* Affiche un temps en millisecondes sur le MAX7219 au format S.mmm (secondes).
-   Digit 1 = gauche ... digit 4 = droite sur ce module. */
+/* Temps en ms affiche au format S.mmm (digit 1 = a gauche sur notre module) */
 static void Display_Time(uint32_t ms) {
-    uint32_t sec  = ms / 1000;   // partie secondes
-    uint32_t frac = ms % 1000;   // partie millisecondes (000-999)
+    uint32_t sec  = ms / 1000;
+    uint32_t frac = ms % 1000;
 
-    MAX7219_DisplayCharDP(1, '0' + (sec % 10), 1);      // secondes (unites) + point, a GAUCHE
-    MAX7219_DisplayChar(2, '0' + (frac / 100) % 10);    // millisecondes (centaines)
-    MAX7219_DisplayChar(3, '0' + (frac / 10) % 10);     // millisecondes (dizaines)
-    MAX7219_DisplayChar(4, '0' + (frac % 10));          // millisecondes (unites), a DROITE
+    MAX7219_DisplayCharDP(1, '0' + (sec % 10), 1);   // secondes + point
+    MAX7219_DisplayChar(2, '0' + (frac / 100) % 10);
+    MAX7219_DisplayChar(3, '0' + (frac / 10) % 10);
+    MAX7219_DisplayChar(4, '0' + (frac % 10));
 }
 
-/* Affiche une hauteur de saut en cm sur le MAX7219.
-   < 100 cm : format XX.X (point decimal sur le digit des unites de cm).
-   >= 100 cm : format XXX (cm entiers, cas rare). */
+/* Hauteur en cm, format XX.X (ou XXX si >= 100 cm) */
 static void Display_Height(float h_cm) {
-    MAX7219_Clear();                       // digits inutilises => vraiment eteints
+    MAX7219_Clear();
     if (h_cm < 0.0f) h_cm = 0.0f;
 
     if (h_cm >= 100.0f) {
         uint32_t cm = (uint32_t)(h_cm + 0.5f);
         if (cm > 999) cm = 999;
-        MAX7219_DisplayChar(2, '0' + (cm / 100) % 10);  // centaines de cm
-        MAX7219_DisplayChar(3, '0' + (cm / 10)  % 10);  // dizaines
-        MAX7219_DisplayChar(4, '0' +  cm        % 10);  // unites
+        MAX7219_DisplayChar(2, '0' + (cm / 100) % 10);
+        MAX7219_DisplayChar(3, '0' + (cm / 10)  % 10);
+        MAX7219_DisplayChar(4, '0' +  cm        % 10);
     } else {
-        uint32_t t = (uint32_t)(h_cm * 10.0f + 0.5f);   // hauteur en dixiemes de cm
-        MAX7219_DisplayChar  (2, '0' + (t / 100) % 10);     // dizaines de cm
-        MAX7219_DisplayCharDP(3, '0' + (t / 10)  % 10, 1);  // unites de cm + point
-        MAX7219_DisplayChar  (4, '0' +  t        % 10);     // dixiemes de cm
+        uint32_t t = (uint32_t)(h_cm * 10.0f + 0.5f);   // en dixiemes de cm
+        MAX7219_DisplayChar  (2, '0' + (t / 100) % 10);
+        MAX7219_DisplayCharDP(3, '0' + (t / 10)  % 10, 1);  // point decimal
+        MAX7219_DisplayChar  (4, '0' +  t        % 10);
     }
 }
 
-/* Affiche "----" (indicateur de vol en cours). Ecrit une seule fois a l'entree
-   de RUNNING : aucune ecriture SPI pendant le vol -> pas de jitter sur la detection. */
+/* "----" pendant le vol (ecrit une seule fois, pas de SPI en l'air) */
 static void Display_Dashes(void) {
     MAX7219_DisplayChar(1, '-');
     MAX7219_DisplayChar(2, '-');
@@ -260,17 +253,16 @@ static void Display_Dashes(void) {
     MAX7219_DisplayChar(4, '-');
 }
 
-/* Affiche l'objectif en cm (entier, cale a droite). Pas de point decimal
-   -> visuellement distinct de la hauteur resultat qui est en XX.X */
+/* Objectif en cm, avec un tiret a gauche pour reperer le mode reglage */
 static void Display_Goal(uint16_t cm) {
     if (cm > 999) cm = 999;
-    MAX7219_DisplayChar(1, '-');                          // marqueur "reglage" a gauche
+    MAX7219_DisplayChar(1, '-');
     MAX7219_DisplayChar(2, cm >= 100 ? '0' + (cm/100)%10 : ' ');
     MAX7219_DisplayChar(3, cm >= 10  ? '0' + (cm/10)%10  : ' ');
     MAX7219_DisplayChar(4, '0' + cm % 10);
 }
 
-/* Affiche l'humidite : "H" + valeur en %% (ex: "H 45"). */
+/* Humidite : "H 45" */
 static void Display_Humidity(uint8_t h) {
     MAX7219_Clear();
     MAX7219_DisplayChar(1, 'H');
@@ -279,16 +271,16 @@ static void Display_Humidity(uint8_t h) {
     MAX7219_DisplayChar(4, '0' + h % 10);
 }
 
-/* Lit le potentiometre RV1 (PA0) et le convertit en objectif 0..GOAL_MAX_CM. */
+/* Potentiometre RV1 sur PA0 : 0-4095 ramene a 0-GOAL_MAX_CM cm */
 static uint16_t ADC_ReadGoal_cm(void) {
     HAL_ADC_Start(&hadc);
     HAL_ADC_PollForConversion(&hadc, 100);
-    uint32_t raw = HAL_ADC_GetValue(&hadc);   // 0..4095 (12 bits)
+    uint32_t raw = HAL_ADC_GetValue(&hadc);
     HAL_ADC_Stop(&hadc);
     return (uint16_t)((raw * GOAL_MAX_CM) / 4095UL);
 }
 
-/* Fait vibrer le moteur (PB4) n fois : ON 200 ms / OFF 150 ms. */
+/* Vibre n fois (200 ms ON / 150 ms OFF) */
 static void Motor_Vibrate(uint8_t n) {
     for (uint8_t i = 0; i < n; i++) {
         HAL_GPIO_WritePin(MOTOR_GPIO_Port, MOTOR_Pin, GPIO_PIN_SET);
@@ -298,10 +290,9 @@ static void Motor_Vibrate(uint8_t n) {
     }
 }
 
-/* Lit un bouton ACTIF BAS (repos = haut, appui = bas) avec pull-up interne.
-   Retourne 1 une seule fois par appui (front descendant). */
+/* Bouton actif bas : renvoie 1 une seule fois par appui */
 static uint8_t Button_Pressed(GPIO_TypeDef *port, uint16_t pin, uint8_t *was_down) {
-    uint8_t down = (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET);  // appui = niveau BAS
+    uint8_t down = (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET);
     uint8_t edge = (down && !*was_down);
     *was_down = down;
     return edge;
@@ -345,14 +336,14 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_Delay(100);
 
-  I2C_BusRecover();                          // deblocage du bus I2C au demarrage
-  LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x60);     // accelero : ODR 416 Hz, +/-2g
-  LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);      // auto-increment des registres
-  HTS221_Init();                             // capteur humidite
+  I2C_BusRecover();                        // au cas ou un capteur soit reste bloque
+  LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x60);   // ODR 416 Hz, +/-2g
+  LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);    // auto-increment
+  HTS221_Init();
 
   MAX7219_Init();
   Display_Time(0);
-  HAL_TIM_Base_Start_IT(&htim6);             // chrono 1 ms
+  HAL_TIM_Base_Start_IT(&htim6);           // tick 1 ms
 
   printf("\r\n=== APEX ===\r\n");
   /* USER CODE END 2 */
@@ -366,24 +357,22 @@ int main(void)
     /* USER CODE BEGIN 3 */
 	  static AppState_t prev_state = APP_IDLE;
 
-	  /* --- Echantillonnage accelero a CHAQUE tour de boucle (resolution maxi) :
-	     avec ODR 416 Hz + I2C 400 kHz, une lecture prend ~0.2 ms -> on ne rate
-	     plus ni le creux de chute libre ni le pic d'impact. --- */
-	  static uint32_t mag = GRAVITY_MG;       // |a| courant en mg
-	  static uint32_t ff_start = 0;           // debut de la fenetre de chute libre (0 = pas en chute libre)
+	  /* Lecture accelero a chaque tour (sans attente, sinon on rate le pic
+	     d'impact qui est tres bref) puis norme du vecteur : |a| = sqrt(x2+y2+z2).
+	     Au repos |a| vaut environ 1000 mg (1 g). */
+	  static uint32_t mag = GRAVITY_MG;
+	  static uint32_t ff_start = 0;   // debut de la chute libre (0 = pas en chute libre)
 	  {
 	      int16_t ax, ay, az;
 	      LSM6DSO_ReadAccel(&ax, &ay, &az);
-	      /* conversion en mg : 0.061 mg/LSB a +/-2g */
-	      int32_t mx = (int32_t)ax * 61 / 1000;
+	      int32_t mx = (int32_t)ax * 61 / 1000;   // 0.061 mg/LSB en +/-2g
 	      int32_t my = (int32_t)ay * 61 / 1000;
 	      int32_t mz = (int32_t)az * 61 / 1000;
 	      mag = (uint32_t)sqrtf((float)(mx*mx + my*my + mz*mz));
 	  }
 
-	  /* Etat reellement traite a cette iteration : sert a detecter l'entree
-	     dans un nouvel etat SANS se faire pieger par un changement de `state`
-	     opere a l'interieur du switch (sinon le corps de RESULT est saute). */
+	  /* on garde l'etat traite a ce tour pour ne pas rater le code d'entree
+	     d'un etat si `state` change au milieu du switch */
 	  AppState_t handling = state;
 
 	  switch (state) {
@@ -396,7 +385,7 @@ int main(void)
 	          b3_down = 0; b4_down = 0; last_goal = 0xFFFF;
 	      }
 	      goal_cm = ADC_ReadGoal_cm();
-	      if (goal_cm != last_goal) {            // rafraichit l'ecran seulement si ca change
+	      if (goal_cm != last_goal) {   // maj ecran seulement si la valeur change
 	          Display_Goal(goal_cm);
 	          last_goal = goal_cm;
 	      }
@@ -414,18 +403,18 @@ int main(void)
 	          Display_Time(0);
 	          ff_start = 0;
 	      }
-	      /* Detection DECOLLAGE : chute libre confirmee sur >= FF_CONFIRM_MS.
-	         t_start = instant ou |a| est PASSE sous le seuil (backdate) -> pas
-	         de retard sur la mesure, et un simple pic de bruit ne declenche pas. */
+	      /* Decollage : |a| doit rester sous le seuil de chute libre pendant
+	         FF_CONFIRM_MS pour eviter les faux departs sur un pic de bruit.
+	         Le chrono part de ff_start, le vrai debut de la chute libre. */
 	      if (mag < FREEFALL_MG) {
-	          if (ff_start == 0) ff_start = tim_ms;          // debut du creux
+	          if (ff_start == 0) ff_start = tim_ms;
 	          if (tim_ms - ff_start >= FF_CONFIRM_MS) {
-	              t_start = ff_start;                        // vrai instant de decollage
+	              t_start = ff_start;
 	              state = APP_RUNNING;
 	              printf("Decollage !\r\n");
 	          }
 	      } else {
-	          ff_start = 0;                                  // pas (ou plus) en chute libre
+	          ff_start = 0;
 	      }
 	      break;
 
@@ -434,21 +423,20 @@ int main(void)
 	          Display_Dashes();      // affichage fige "----", zero SPI pendant le vol
 	      }
 	      {
-	          uint32_t elapsed = tim_ms - t_start;   // temps ecoule en ms
-	          /* Detection ATTERRISSAGE : pic d'acceleration (impact) */
+	          uint32_t elapsed = tim_ms - t_start;
+	          /* Atterrissage = pic d'acceleration */
 	          if (mag > IMPACT_MG) {
 	              uint32_t air = tim_ms - t_start;
 	              if (air >= AIRTIME_MIN_MS && air <= AIRTIME_MAX_MS) {
-	                  hang_time = air;               // temps en l'air valide
+	                  hang_time = air;
 	                  state = APP_RESULT;
 	                  printf("Atterrissage : %lu ms en l'air\r\n", (unsigned long)air);
 	              } else {
-	                  /* trop court/trop long => faux declenchement, on annule */
+	                  /* trop court ou trop long : faux declenchement */
 	                  printf("Saut ignore (%lu ms hors plage)\r\n", (unsigned long)air);
 	                  state = APP_IDLE;
 	              }
 	          } else if (elapsed > AIRTIME_MAX_MS) {
-	              /* jamais d'impact detecte => on abandonne la mesure */
 	              printf("Aucun impact detecte, annule.\r\n");
 	              state = APP_IDLE;
 	          }
@@ -457,37 +445,34 @@ int main(void)
 
 	  case APP_RESULT:
 	      if (prev_state != APP_RESULT) {
-	          /* Hauteur du saut a partir du temps de vol :
-	             temps montee = temps descente = t/2, donc
-	             h = 1/2 * g * (t/2)^2 = g * t^2 / 8  (t en s, g = 9.81 m/s^2).
-	             En cm : h_cm = 9.81 * (t_ms/1000)^2 / 8 * 100 */
+	          /* h = g*t^2/8 : montee = descente = t/2, donc
+	             h = 1/2 * g * (t/2)^2. Ici en cm avec t en ms. */
 	          float t_s  = hang_time / 1000.0f;
 	          float h_cm = 9.81f * t_s * t_s / 8.0f * 100.0f;
-	          uint16_t h_int = (uint16_t)(h_cm + 0.5f);   // hauteur arrondie en cm
-	          uint8_t  hum   = HTS221_ReadHumidity();     // 2eme capteur : conditions ambiantes
+	          uint16_t h_int = (uint16_t)(h_cm + 0.5f);
+	          uint8_t  hum   = HTS221_ReadHumidity();
 	          printf("Saut : %d.%d cm  (%lu ms)  |  objectif %u cm  |  humidite %u%%\r\n",
 	                 (int)h_cm, (int)(h_cm * 10.0f + 0.5f) % 10,
 	                 (unsigned long)hang_time, goal_cm, hum);
 
-	          /* Affiche la hauteur, puis VICTOIRE (moteur) si l'objectif est atteint */
 	          Display_Height(h_cm);
 	          if (h_int >= goal_cm) {
 	              printf("Objectif atteint ! %u cm (>= %u)\r\n", h_int, goal_cm);
-	              Motor_Vibrate(3);            // 3 vibrations = victoire (~1 s)
+	              Motor_Vibrate(3);   // victoire
 	          } else {
 	              printf("Rate : manque %u cm\r\n", (unsigned)(goal_cm - h_int));
 	              HAL_Delay(1500);
 	          }
-	          /* Alterne HAUTEUR, TEMPS en l'air et HUMIDITE, en terminant sur la hauteur. */
+	          /* on alterne hauteur / temps / humidite, et on finit sur la hauteur */
 	          Display_Time(hang_time);  HAL_Delay(2000);
 	          Display_Humidity(hum);    HAL_Delay(2000);
 	          Display_Height(h_cm);     HAL_Delay(2000);
-	          state = APP_SETUP;       // retour au reglage de l'objectif pour le prochain saut
+	          state = APP_SETUP;   // retour au reglage pour le saut suivant
 	      }
 	      break;
 	  }
 
-	  prev_state = handling;   // etat traite, pas l'etat (eventuellement) modifie
+	  prev_state = handling;
   }
   /* USER CODE END 3 */
 }
