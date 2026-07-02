@@ -49,12 +49,14 @@
 #define HTS221_H1_OUT_L   0x3A
 #define HTS221_HUM_OUT_L  0x28   /* mesure d'humidite brute */
 
-/* --- Detection de saut par seuils sur |a| (en mg, 1000 mg = 1 g) --- */
+/* --- Detection de saut par seuils logiciels sur |a| (en mg) --- */
 #define FREEFALL_MG     300   /* |a| sous ce seuil = chute libre => decollage */
 #define IMPACT_MG      1800   /* |a| au dessus de ce seuil = impact => atterrissage */
 #define AIRTIME_MIN_MS   80   /* rejette les faux declenchements (bruit) */
 #define AIRTIME_MAX_MS 2000   /* garde-fou : au dela on annule la mesure */
+#define GRAVITY_MG     1000   /* 1 g de reference */
 #define FF_CONFIRM_MS    15   /* chute libre confirmee si |a| reste bas >= ce temps */
+#define GOAL_MAX_CM      99   /* objectif max (potentiometre a fond) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -77,12 +79,7 @@ UART_HandleTypeDef huart2;
 volatile AppState_t state   = APP_SETUP;   /* on demarre par le reglage de l'objectif */
 volatile uint32_t   t_start = 0;           /* date du decollage (en ms, via tim_ms) */
 volatile uint32_t   hang_time = 0;         /* temps passe en l'air (ms) */
-
-AppState_t prev_state = APP_IDLE;   /* dernier etat traite (pour executer le code d'entree d'un etat une seule fois) */
-uint16_t   goal_cm    = 20;         /* objectif de saut en cm (regle au potentiometre) */
-uint16_t   last_goal  = 0xFFFF;     /* dernier objectif affiche (pour ne pas reecrire l'ecran inutilement) */
-uint32_t   mag        = 1000;       /* norme de l'acceleration |a| en mg (1000 = 1 g au repos) */
-uint32_t   ff_start   = 0;          /* date de debut de la chute libre (0 = pas en chute libre) */
+uint16_t            goal_cm  = 20;         /* objectif de saut en cm (regle au potentiometre) */
 
 /* USER CODE END PV */
 
