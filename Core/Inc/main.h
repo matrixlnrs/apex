@@ -37,9 +37,10 @@ extern "C" {
 /* Exported types ------------------------------------------------------------*/
 /* USER CODE BEGIN ET */
 typedef enum {
-    APP_IDLE    = 0,
-    APP_RUNNING = 1,
-    APP_RESULT  = 2
+    APP_SETUP   = 0,   /* reglage de l'objectif au potentiometre + validation */
+    APP_IDLE    = 1,   /* pret : attend le decollage (chute libre) */
+    APP_RUNNING = 2,   /* en l'air */
+    APP_RESULT  = 3    /* resultat + victoire (moteur) */
 } AppState_t;
 
 
@@ -98,13 +99,14 @@ void Error_Handler(void);
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
 #define TCK_GPIO_Port GPIOA
-/* LSM6DSO interruptions (ex-SWO PB3 libere) */
-#define LSM_INT1_Pin GPIO_PIN_4
-#define LSM_INT1_GPIO_Port GPIOB
-#define LSM_INT1_EXTI_IRQn EXTI4_IRQn
-#define LSM_INT2_Pin GPIO_PIN_3
-#define LSM_INT2_GPIO_Port GPIOB
-#define LSM_INT2_EXTI_IRQn EXTI3_IRQn
+/* Moteur de vibration : pilote via PB4 (ex-TIM3_CH1 du TP04), utilise en GPIO */
+#define MOTOR_Pin GPIO_PIN_4
+#define MOTOR_GPIO_Port GPIOB
+/* Boutons de validation objectif (carte ISEN32, GPIOC) */
+#define BTN3_Pin GPIO_PIN_6
+#define BTN3_GPIO_Port GPIOC
+#define BTN4_Pin GPIO_PIN_5
+#define BTN4_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 

@@ -40,12 +40,15 @@
 #define LSM6DSO_CTRL1_XL  0x10   /* config accelero (ODR + plage) */
 #define LSM6DSO_CTRL3_C   0x12   /* auto-increment registres */
 #define LSM6DSO_OUTX_L_A  0x28   /* debut des 6 octets X/Y/Z */
-#define LSM6DSO_WAKE_UP_THS 0x5B /* seuil wake-up (impact) */
-#define LSM6DSO_WAKE_UP_DUR 0x5C
-#define LSM6DSO_FREE_FALL   0x5D /* seuil + duree chute libre */
-#define LSM6DSO_MD1_CFG     0x5E /* routage vers INT1 */
-#define LSM6DSO_MD2_CFG     0x5F /* routage vers INT2 */
-#define LSM6DSO_ALL_INT_SRC 0x1A /* lecture pour acquitter les IT */
+
+/* HTS221 (humidite) - 2eme capteur du shield IKS01A3, adresse I2C 8 bits */
+#define HTS221_ADDR       0xBE
+#define HTS221_CTRL_REG1  0x20   /* power-on + ODR */
+#define HTS221_H0_RH_X2   0x30   /* calibration : humidites de reference */
+#define HTS221_H1_RH_X2   0x31
+#define HTS221_H0_OUT_L   0x36   /* calibration : sorties brutes de reference */
+#define HTS221_H1_OUT_L   0x3A
+#define HTS221_HUM_OUT_L  0x28   /* mesure d'humidite brute */
 
 /* --- Detection de saut par seuils logiciels sur |a| (en mg) --- */
 #define FREEFALL_MG     300   /* |a| sous ce seuil = chute libre => decollage */
@@ -54,6 +57,7 @@
 #define AIRTIME_MAX_MS 2000   /* garde-fou : au dela on annule la mesure */
 #define GRAVITY_MG     1000   /* 1 g de reference */
 #define FF_CONFIRM_MS    15   /* chute libre confirmee si |a| reste bas >= ce temps */
+#define GOAL_MAX_CM      99   /* objectif max (potentiometre a fond) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,17 +77,10 @@ TIM_HandleTypeDef htim6;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-volatile AppState_t state   = APP_IDLE;
+volatile AppState_t state   = APP_SETUP;   /* on demarre par le reglage de l'objectif */
 volatile uint32_t   t_start = 0;
 volatile uint32_t   hang_time = 0;
-
-/* Phase B1 : flags leves par les ISR LSM6DSO (validation detection) */
-volatile uint8_t flag_takeoff = 0;   /* INT1 : chute libre (decollage) */
-volatile uint8_t flag_landing = 0;   /* INT2 : impact (atterrissage) */
-
-/* DIAG : compteurs d'IT pour detecter un emballement (PB3 = SWO partage ?) */
-volatile uint32_t exti3_irq_count = 0;   /* INT2 / PB3 */
-volatile uint32_t exti4_irq_count = 0;   /* INT1 / PB4 */
+uint16_t            goal_cm  = 20;         /* objectif de saut en cm (regle au potentiometre) */
 
 /* USER CODE END PV */
 
@@ -200,6 +197,54 @@ static void LSM6DSO_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az) {
     *az = (int16_t)(d[5] << 8 | d[4]);
 }
 
+/* ===== HTS221 : humidite (2eme capteur) ===== */
+static int16_t hts_h0_out = 0, hts_h1_out = 0;   /* coefficients de calibration */
+static uint8_t hts_h0_rh  = 0, hts_h1_rh  = 0;
+
+static void HTS221_Write(uint8_t reg, uint8_t val) {
+    uint8_t buf[2] = {reg, val};
+    HAL_I2C_Master_Transmit(&hi2c1, HTS221_ADDR, buf, 2, 10);
+}
+
+static uint8_t HTS221_Read(uint8_t reg) {
+    uint8_t val = 0;
+    HAL_I2C_Master_Transmit(&hi2c1, HTS221_ADDR, &reg, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c1, HTS221_ADDR, &val, 1, 10);
+    return val;
+}
+
+/* Lit les coefficients de calibration usine (une fois au demarrage) */
+static void HTS221_ReadCalibration(void) {
+    hts_h0_rh = HTS221_Read(HTS221_H0_RH_X2) >> 1;
+    hts_h1_rh = HTS221_Read(HTS221_H1_RH_X2) >> 1;
+    uint8_t lo, hi;
+    lo = HTS221_Read(HTS221_H0_OUT_L);
+    hi = HTS221_Read(HTS221_H0_OUT_L + 1);
+    hts_h0_out = (int16_t)(hi << 8 | lo);
+    lo = HTS221_Read(HTS221_H1_OUT_L);
+    hi = HTS221_Read(HTS221_H1_OUT_L + 1);
+    hts_h1_out = (int16_t)(hi << 8 | lo);
+}
+
+static void HTS221_Init(void) {
+    HTS221_Write(HTS221_CTRL_REG1, 0x81);   // power-on, ODR 1 Hz
+    HTS221_ReadCalibration();
+    printf("[HTS221] Init OK\r\n");
+}
+
+/* Renvoie l'humidite relative en %% (0-100), interpolee via la calibration usine */
+static uint8_t HTS221_ReadHumidity(void) {
+    uint8_t lo = HTS221_Read(HTS221_HUM_OUT_L);
+    uint8_t hi = HTS221_Read(HTS221_HUM_OUT_L + 1);
+    int16_t h_raw = (int16_t)(hi << 8 | lo);
+    int32_t num = (int32_t)(hts_h1_rh - hts_h0_rh) * (h_raw - hts_h0_out);
+    int32_t den = hts_h1_out - hts_h0_out;
+    int32_t hum = hts_h0_rh + (den != 0 ? num / den : 0);
+    if (hum < 0)   hum = 0;
+    if (hum > 100) hum = 100;
+    return (uint8_t)hum;
+}
+
 /* Affiche un temps en millisecondes sur le MAX7219 au format S.mmm (secondes).
    Digit 1 = gauche ... digit 4 = droite sur ce module. */
 static void Display_Time(uint32_t ms) {
@@ -241,6 +286,57 @@ static void Display_Dashes(void) {
     MAX7219_DisplayChar(3, '-');
     MAX7219_DisplayChar(4, '-');
 }
+
+/* Affiche l'objectif en cm (entier, cale a droite). Pas de point decimal
+   -> visuellement distinct de la hauteur resultat qui est en XX.X */
+static void Display_Goal(uint16_t cm) {
+    if (cm > 999) cm = 999;
+    MAX7219_DisplayChar(1, '-');                          // marqueur "reglage" a gauche
+    MAX7219_DisplayChar(2, cm >= 100 ? '0' + (cm/100)%10 : ' ');
+    MAX7219_DisplayChar(3, cm >= 10  ? '0' + (cm/10)%10  : ' ');
+    MAX7219_DisplayChar(4, '0' + cm % 10);
+}
+
+/* Affiche l'humidite : "H" + valeur en %% (ex: "H 45"). */
+static void Display_Humidity(uint8_t h) {
+    MAX7219_Clear();
+    MAX7219_DisplayChar(1, 'H');
+    MAX7219_DisplayChar(2, ' ');
+    MAX7219_DisplayChar(3, h >= 10 ? '0' + (h / 10) % 10 : ' ');
+    MAX7219_DisplayChar(4, '0' + h % 10);
+}
+
+/* DIAG : derniers raw/status ADC, pour verifier si le potentiometre bouge. */
+static uint16_t g_adc_raw = 0;
+static HAL_StatusTypeDef g_adc_st = HAL_OK;
+
+/* Lit le potentiometre RV1 (PA0) et le convertit en objectif 0..GOAL_MAX_CM. */
+static uint16_t ADC_ReadGoal_cm(void) {
+    HAL_ADC_Start(&hadc);
+    g_adc_st  = HAL_ADC_PollForConversion(&hadc, 100);
+    g_adc_raw = (uint16_t)HAL_ADC_GetValue(&hadc);   // 0..4095 (12 bits)
+    HAL_ADC_Stop(&hadc);
+    return (uint16_t)(((uint32_t)g_adc_raw * GOAL_MAX_CM) / 4095UL);
+}
+
+/* Fait vibrer le moteur (PB4) n fois : ON 200 ms / OFF 150 ms. */
+static void Motor_Vibrate(uint8_t n) {
+    for (uint8_t i = 0; i < n; i++) {
+        HAL_GPIO_WritePin(MOTOR_GPIO_Port, MOTOR_Pin, GPIO_PIN_SET);
+        HAL_Delay(200);
+        HAL_GPIO_WritePin(MOTOR_GPIO_Port, MOTOR_Pin, GPIO_PIN_RESET);
+        HAL_Delay(150);
+    }
+}
+
+/* Lit un bouton ACTIF BAS (repos = haut, appui = bas) avec pull-up interne.
+   Retourne 1 une seule fois par appui (front descendant). */
+static uint8_t Button_Pressed(GPIO_TypeDef *port, uint16_t pin, uint8_t *was_down) {
+    uint8_t down = (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_RESET);  // appui = niveau BAS
+    uint8_t edge = (down && !*was_down);
+    *was_down = down;
+    return edge;
+}
 /* USER CODE END 0 */
 
 /**
@@ -279,7 +375,7 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_Delay(100);
-  printf("=== VertiSense Ready ===\r\n");
+  printf("=== APEX Ready ===\r\n");
   I2C_BusRecover();     /* diagnostic + deblocage du bus avant tout acces */
   I2C_Scan();
 
@@ -289,18 +385,13 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim6);
   printf("TIM6 OK\r\n");
 
-  /* --- LSM6DSO : accelero + detection chute libre (INT1) / impact (INT2) --- */
+  /* --- LSM6DSO : accelero seul (detection saut 100%% logicielle sur |a|) --- */
   uint8_t who = LSM6DSO_Read(LSM6DSO_WHO_AM_I);
   printf("[LSM6DSO] WHO_AM_I = 0x%02X (attendu 0x6C)\r\n", who);
   LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x60);    // ODR 416 Hz, plage +/-2g (echantillonnage rapide)
   LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);     // auto-increment des registres
-  LSM6DSO_Write(LSM6DSO_FREE_FALL, 0x33);   // seuil chute libre ~312 mg, duree ~58 ms
-  LSM6DSO_Write(LSM6DSO_WAKE_UP_THS, 0x08); // seuil impact = 8 x 62.5 mg = 500 mg
-  LSM6DSO_Write(LSM6DSO_WAKE_UP_DUR, 0x00);
-  LSM6DSO_Write(LSM6DSO_MD1_CFG, 0x10);     // chute libre -> INT1 (PB4)
-  LSM6DSO_Write(LSM6DSO_MD2_CFG, 0x20);     // wake-up (impact) -> INT2 (PB3)
-  LSM6DSO_Read(LSM6DSO_ALL_INT_SRC);        // purge des IT residuelles
-  printf("[LSM6DSO] Detection chute libre / impact armee\r\n");
+  HTS221_Init();                            // 2eme capteur : humidite
+  printf("[SETUP] Tourne RV1 pour l'objectif, BTN3/BTN4 pour valider\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -342,9 +433,39 @@ int main(void)
 
 	  switch (state) {
 
+	  case APP_SETUP: {
+	      static uint8_t  b3_down = 0, b4_down = 0;
+	      static uint16_t last_goal = 0xFFFF;
+	      if (prev_state != APP_SETUP) {
+	          printf("SETUP - regle l'objectif (RV1), valide (BTN3/BTN4)\r\n");
+	          b3_down = 0; b4_down = 0; last_goal = 0xFFFF;
+	      }
+	      goal_cm = ADC_ReadGoal_cm();
+	      if (goal_cm != last_goal) {            // rafraichit l'ecran seulement si ca change
+	          Display_Goal(goal_cm);
+	          last_goal = goal_cm;
+	      }
+	      /* DIAG ADC : affiche la valeur brute toutes les 300 ms. Tourne RV1 et
+	         observe 'raw' : s'il ne bouge pas, le potentiometre n'atteint pas PA0. */
+	      {
+	          static uint32_t last_adc_log = 0;
+	          if (HAL_GetTick() - last_adc_log >= 300) {
+	              last_adc_log = HAL_GetTick();
+	              printf("[ADC] raw=%u  st=%d  goal=%u cm\r\n",
+	                     g_adc_raw, (int)g_adc_st, goal_cm);
+	          }
+	      }
+	      if (Button_Pressed(BTN3_GPIO_Port, BTN3_Pin, &b3_down) ||
+	          Button_Pressed(BTN4_GPIO_Port, BTN4_Pin, &b4_down)) {
+	          printf(">> OBJECTIF VALIDE : %u cm -- a toi de sauter !\r\n", goal_cm);
+	          state = APP_IDLE;
+	      }
+	      break;
+	  }
+
 	  case APP_IDLE:
 	      if (prev_state != APP_IDLE) {
-	          printf("IDLE - Saute pour demarrer\r\n");
+	          printf("IDLE (objectif %u cm) - Saute pour demarrer\r\n", goal_cm);
 	          Display_Time(0);
 	          ff_start = 0;
 	      }
@@ -399,16 +520,26 @@ int main(void)
 	             En cm : h_cm = 9.81 * (t_ms/1000)^2 / 8 * 100 */
 	          float t_s  = hang_time / 1000.0f;
 	          float h_cm = 9.81f * t_s * t_s / 8.0f * 100.0f;
-	          printf("=== Temps en l'air : %lu ms  ->  hauteur : %d.%d cm ===\r\n",
+	          uint16_t h_int = (uint16_t)(h_cm + 0.5f);   // hauteur arrondie en cm
+	          uint8_t  hum   = HTS221_ReadHumidity();     // 2eme capteur : conditions ambiantes
+	          printf("=== Temps : %lu ms -> hauteur : %d.%d cm (objectif %u cm) | humidite %u%% ===\r\n",
 	                 (unsigned long)hang_time,
-	                 (int)h_cm, (int)(h_cm * 10.0f + 0.5f) % 10);
-	          /* Alterne HAUTEUR (resultat principal) et TEMPS en l'air, en
-	             terminant sur la hauteur. Formats distincts a l'ecran :
-	             hauteur "42.7" (digit gauche eteint), temps "0.590". */
-	          Display_Height(h_cm);   HAL_Delay(2000);
-	          Display_Time(hang_time); HAL_Delay(2000);
-	          Display_Height(h_cm);   HAL_Delay(2000);
-	          state = APP_IDLE;
+	                 (int)h_cm, (int)(h_cm * 10.0f + 0.5f) % 10, goal_cm, hum);
+
+	          /* Affiche la hauteur, puis VICTOIRE (moteur) si l'objectif est atteint */
+	          Display_Height(h_cm);
+	          if (h_int >= goal_cm) {
+	              printf(">>> OBJECTIF ATTEINT ! (%u >= %u cm) <<<\r\n", h_int, goal_cm);
+	              Motor_Vibrate(3);            // 3 vibrations = victoire (~1 s)
+	          } else {
+	              printf(">>> Manque %u cm <<<\r\n", (unsigned)(goal_cm - h_int));
+	              HAL_Delay(1500);
+	          }
+	          /* Alterne HAUTEUR, TEMPS en l'air et HUMIDITE, en terminant sur la hauteur. */
+	          Display_Time(hang_time);  HAL_Delay(2000);
+	          Display_Humidity(hum);    HAL_Delay(2000);
+	          Display_Height(h_cm);     HAL_Delay(2000);
+	          state = APP_SETUP;       // retour au reglage de l'objectif pour le prochain saut
 	      }
 	      break;
 	  }
@@ -724,17 +855,20 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* LSM6DSO INT1 (PB4, decollage) et INT2 (PB3, atterrissage) : front montant.
-     PB3 etait le SWO -> reaffecte en EXTI (on garde le debug SWD PA13/PA14). */
-  GPIO_InitStruct.Pin  = LSM_INT1_Pin | LSM_INT2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  /* Moteur de vibration sur PB4 (sortie push-pull, repos = 0) */
+  HAL_GPIO_WritePin(MOTOR_GPIO_Port, MOTOR_Pin, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin   = MOTOR_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(MOTOR_GPIO_Port, &GPIO_InitStruct);
 
-  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
-  HAL_NVIC_SetPriority(EXTI3_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+  /* Boutons BTN3 (PC6) / BTN4 (PC5) : entrees ACTIVES BAS, pull-up interne
+     (repos = 1, appui = 0), lues par polling dans l'etat SETUP. */
+  GPIO_InitStruct.Pin  = BTN3_Pin | BTN4_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
