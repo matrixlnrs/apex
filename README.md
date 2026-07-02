@@ -125,7 +125,7 @@ Config/CUBEMX.md                # notes de configuration CubeMX
 ## 🎮 Utilisation rapide
 
 1. Brancher la carte (USB ST-Link). Ouvrir un terminal série à 115200 bauds.
-2. Au démarrage : `=== APEX Ready ===`, scan I2C, `[LSM6DSO] WHO_AM_I = 0x6C`, `[HTS221] Init OK`.
+2. Au démarrage : `=== APEX ===` puis `Regle l'objectif avec RV1, puis valide (BTN3/BTN4).`
 3. **Tourner RV1** → l'objectif s'affiche. **Appuyer BTN3/BTN4** pour valider.
 4. **Sauter** avec le boîtier. Lire la hauteur / le temps sur l'afficheur.
 5. Objectif atteint → le moteur vibre. Retour automatique au réglage.
