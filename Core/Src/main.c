@@ -36,7 +36,6 @@
 /* USER CODE BEGIN PD */
 /* LSM6DSO (accelerometre) - adresse I2C 8 bits (deja decalee pour HAL) */
 #define LSM6DSO_ADDR      0xD6
-#define LSM6DSO_WHO_AM_I  0x0F   /* doit valoir 0x6C */
 #define LSM6DSO_CTRL1_XL  0x10   /* config accelero (ODR + plage) */
 #define LSM6DSO_CTRL3_C   0x12   /* auto-increment registres */
 #define LSM6DSO_OUTX_L_A  0x28   /* debut des 6 octets X/Y/Z */
@@ -50,14 +49,12 @@
 #define HTS221_H1_OUT_L   0x3A
 #define HTS221_HUM_OUT_L  0x28   /* mesure d'humidite brute */
 
-/* --- Detection de saut par seuils logiciels sur |a| (en mg) --- */
+/* --- Detection de saut par seuils sur |a| (en mg, 1000 mg = 1 g) --- */
 #define FREEFALL_MG     300   /* |a| sous ce seuil = chute libre => decollage */
 #define IMPACT_MG      1800   /* |a| au dessus de ce seuil = impact => atterrissage */
 #define AIRTIME_MIN_MS   80   /* rejette les faux declenchements (bruit) */
 #define AIRTIME_MAX_MS 2000   /* garde-fou : au dela on annule la mesure */
-#define GRAVITY_MG     1000   /* 1 g de reference */
 #define FF_CONFIRM_MS    15   /* chute libre confirmee si |a| reste bas >= ce temps */
-#define GOAL_MAX_CM      99   /* objectif max (potentiometre a fond) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -78,9 +75,14 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 volatile AppState_t state   = APP_SETUP;   /* on demarre par le reglage de l'objectif */
-volatile uint32_t   t_start = 0;
-volatile uint32_t   hang_time = 0;
-uint16_t            goal_cm  = 20;         /* objectif de saut en cm (regle au potentiometre) */
+volatile uint32_t   t_start = 0;           /* date du decollage (en ms, via tim_ms) */
+volatile uint32_t   hang_time = 0;         /* temps passe en l'air (ms) */
+
+AppState_t prev_state = APP_IDLE;   /* dernier etat traite (pour executer le code d'entree d'un etat une seule fois) */
+uint16_t   goal_cm    = 20;         /* objectif de saut en cm (regle au potentiometre) */
+uint16_t   last_goal  = 0xFFFF;     /* dernier objectif affiche (pour ne pas reecrire l'ecran inutilement) */
+uint32_t   mag        = 1000;       /* norme de l'acceleration |a| en mg (1000 = 1 g au repos) */
+uint32_t   ff_start   = 0;          /* date de debut de la chute libre (0 = pas en chute libre) */
 
 /* USER CODE END PV */
 
@@ -124,12 +126,9 @@ static void I2C_BusRecover(void) {
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8 | GPIO_PIN_9, GPIO_PIN_SET);
     HAL_Delay(1);
 
-    int scl = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8);
     int sda = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_9);
-    printf("[I2C] Etat repos : SCL=%d SDA=%d (attendu 1/1)\r\n", scl, sda);
 
-    if (sda == 0) {
-        printf("[I2C] SDA bloque a 0 -> tentative de deblocage (9 clocks)\r\n");
+    if (sda == 0) {   /* SDA tenu bas => un esclave est coince, on genere des clocks */
         for (int i = 0; i < 9; i++) {
             HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
             HAL_Delay(1);
@@ -148,17 +147,6 @@ static void I2C_BusRecover(void) {
 
     /* Remet le peripherique I2C en service (reconfigure PB8/PB9 en AF) */
     MX_I2C1_Init();
-    printf("[I2C] Bus reinitialise\r\n");
-}
-
-static void I2C_Scan(void) {
-    printf("--- Scan I2C ---\r\n");
-    for (uint8_t addr = 1; addr < 128; addr++) {
-        if (HAL_I2C_IsDeviceReady(&hi2c1, addr << 1, 1, 10) == HAL_OK) {
-            printf("Trouve : 0x%02X\r\n", addr << 1);
-        }
-    }
-    printf("--- Fin scan ---\r\n");
 }
 
 volatile uint32_t tim_ms = 0;
@@ -175,23 +163,12 @@ static void LSM6DSO_Write(uint8_t reg, uint8_t val) {
     HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, buf, 2, 10);
 }
 
-static uint8_t LSM6DSO_Read(uint8_t reg) {
-    uint8_t val = 0;
-    HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
-    HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, &val, 1, 10);
-    return val;
-}
-
 /* Lit les 3 axes accelero (raw, LSB). Auto-increment active via CTRL3_C. */
 static void LSM6DSO_ReadAccel(int16_t *ax, int16_t *ay, int16_t *az) {
     uint8_t reg = LSM6DSO_OUTX_L_A;
-    uint8_t d[6] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};  /* DIAG : sentinelle si jamais ecrasee */
-    HAL_StatusTypeDef st_tx = HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
-    HAL_StatusTypeDef st_rx = HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, d, 6, 10);
-    if (st_tx != HAL_OK || st_rx != HAL_OK) {
-        printf("[I2C] ERREUR lecture accel : tx=%d rx=%d err=0x%lx\r\n",
-               st_tx, st_rx, (unsigned long)HAL_I2C_GetError(&hi2c1));
-    }
+    uint8_t d[6];
+    HAL_I2C_Master_Transmit(&hi2c1, LSM6DSO_ADDR, &reg, 1, 10);
+    HAL_I2C_Master_Receive(&hi2c1, LSM6DSO_ADDR, d, 6, 10);
     *ax = (int16_t)(d[1] << 8 | d[0]);
     *ay = (int16_t)(d[3] << 8 | d[2]);
     *az = (int16_t)(d[5] << 8 | d[4]);
@@ -229,7 +206,6 @@ static void HTS221_ReadCalibration(void) {
 static void HTS221_Init(void) {
     HTS221_Write(HTS221_CTRL_REG1, 0x81);   // power-on, ODR 1 Hz
     HTS221_ReadCalibration();
-    printf("[HTS221] Init OK\r\n");
 }
 
 /* Renvoie l'humidite relative en %% (0-100), interpolee via la calibration usine */
@@ -371,23 +347,17 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_Delay(100);
-  printf("=== APEX Ready ===\r\n");
-  I2C_BusRecover();     /* diagnostic + deblocage du bus avant tout acces */
-  I2C_Scan();
+
+  I2C_BusRecover();                          // deblocage du bus I2C au demarrage
+  LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x60);     // accelero : ODR 416 Hz, +/-2g
+  LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);      // auto-increment des registres
+  HTS221_Init();                             // capteur humidite
 
   MAX7219_Init();
-  Display_Time(0);          // affiche 0.000 au demarrage
+  Display_Time(0);
+  HAL_TIM_Base_Start_IT(&htim6);             // chrono 1 ms
 
-  HAL_TIM_Base_Start_IT(&htim6);
-  printf("TIM6 OK\r\n");
-
-  /* --- LSM6DSO : accelero seul (detection saut 100%% logicielle sur |a|) --- */
-  uint8_t who = LSM6DSO_Read(LSM6DSO_WHO_AM_I);
-  printf("[LSM6DSO] WHO_AM_I = 0x%02X (attendu 0x6C)\r\n", who);
-  LSM6DSO_Write(LSM6DSO_CTRL1_XL, 0x60);    // ODR 416 Hz, plage +/-2g (echantillonnage rapide)
-  LSM6DSO_Write(LSM6DSO_CTRL3_C, 0x04);     // auto-increment des registres
-  HTS221_Init();                            // 2eme capteur : humidite
-  printf("[SETUP] Tourne RV1 pour l'objectif, BTN3/BTN4 pour valider\r\n");
+  printf("\r\n=== APEX ===\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -402,7 +372,6 @@ int main(void)
 	  /* --- Echantillonnage accelero a CHAQUE tour de boucle (resolution maxi) :
 	     avec ODR 416 Hz + I2C 400 kHz, une lecture prend ~0.2 ms -> on ne rate
 	     plus ni le creux de chute libre ni le pic d'impact. --- */
-	  static uint32_t last_log = 0;
 	  static uint32_t mag = GRAVITY_MG;       // |a| courant en mg
 	  static uint32_t ff_start = 0;           // debut de la fenetre de chute libre (0 = pas en chute libre)
 	  {
@@ -413,13 +382,6 @@ int main(void)
 	      int32_t my = (int32_t)ay * 61 / 1000;
 	      int32_t mz = (int32_t)az * 61 / 1000;
 	      mag = (uint32_t)sqrtf((float)(mx*mx + my*my + mz*mz));
-	  }
-
-	  /* Log UART throttle 200 ms, UNIQUEMENT au repos : pendant le vol le printf
-	     (~3 ms bloquant) jitterait la detection d'impact. */
-	  if (state == APP_IDLE && HAL_GetTick() - last_log >= 200) {
-	      last_log = HAL_GetTick();
-	      printf("A: |a|=%lu mg\r\n", (unsigned long)mag);
 	  }
 
 	  /* Etat reellement traite a cette iteration : sert a detecter l'entree
@@ -433,7 +395,7 @@ int main(void)
 	      static uint8_t  b3_down = 0, b4_down = 0;
 	      static uint16_t last_goal = 0xFFFF;
 	      if (prev_state != APP_SETUP) {
-	          printf("SETUP - regle l'objectif (RV1), valide (BTN3/BTN4)\r\n");
+	          printf("Regle l'objectif avec RV1, puis valide (BTN3/BTN4).\r\n");
 	          b3_down = 0; b4_down = 0; last_goal = 0xFFFF;
 	      }
 	      goal_cm = ADC_ReadGoal_cm();
@@ -443,7 +405,7 @@ int main(void)
 	      }
 	      if (Button_Pressed(BTN3_GPIO_Port, BTN3_Pin, &b3_down) ||
 	          Button_Pressed(BTN4_GPIO_Port, BTN4_Pin, &b4_down)) {
-	          printf(">> OBJECTIF VALIDE : %u cm -- a toi de sauter !\r\n", goal_cm);
+	          printf("Objectif regle : %u cm.\r\n", goal_cm);
 	          state = APP_IDLE;
 	      }
 	      break;
@@ -451,7 +413,7 @@ int main(void)
 
 	  case APP_IDLE:
 	      if (prev_state != APP_IDLE) {
-	          printf("IDLE (objectif %u cm) - Saute pour demarrer\r\n", goal_cm);
+	          printf("Pret - saute ! (objectif %u cm)\r\n", goal_cm);
 	          Display_Time(0);
 	          ff_start = 0;
 	      }
@@ -463,7 +425,7 @@ int main(void)
 	          if (tim_ms - ff_start >= FF_CONFIRM_MS) {
 	              t_start = ff_start;                        // vrai instant de decollage
 	              state = APP_RUNNING;
-	              printf(">> TAKEOFF t_start=%lu\r\n", (unsigned long)t_start);
+	              printf("Decollage !\r\n");
 	          }
 	      } else {
 	          ff_start = 0;                                  // pas (ou plus) en chute libre
@@ -472,7 +434,6 @@ int main(void)
 
 	  case APP_RUNNING:
 	      if (prev_state != APP_RUNNING) {
-	          printf("RUNNING - en l'air...\r\n");
 	          Display_Dashes();      // affichage fige "----", zero SPI pendant le vol
 	      }
 	      {
@@ -483,16 +444,15 @@ int main(void)
 	              if (air >= AIRTIME_MIN_MS && air <= AIRTIME_MAX_MS) {
 	                  hang_time = air;               // temps en l'air valide
 	                  state = APP_RESULT;
-	                  printf(">> LANDING air=%lu ms\r\n", (unsigned long)air);
+	                  printf("Atterrissage : %lu ms en l'air\r\n", (unsigned long)air);
 	              } else {
 	                  /* trop court/trop long => faux declenchement, on annule */
-	                  printf("(faux declenchement : %lu ms ignore)\r\n",
-	                         (unsigned long)air);
+	                  printf("Saut ignore (%lu ms hors plage)\r\n", (unsigned long)air);
 	                  state = APP_IDLE;
 	              }
 	          } else if (elapsed > AIRTIME_MAX_MS) {
 	              /* jamais d'impact detecte => on abandonne la mesure */
-	              printf("(timeout : pas d'impact detecte)\r\n");
+	              printf("Aucun impact detecte, annule.\r\n");
 	              state = APP_IDLE;
 	          }
 	      }
@@ -508,17 +468,17 @@ int main(void)
 	          float h_cm = 9.81f * t_s * t_s / 8.0f * 100.0f;
 	          uint16_t h_int = (uint16_t)(h_cm + 0.5f);   // hauteur arrondie en cm
 	          uint8_t  hum   = HTS221_ReadHumidity();     // 2eme capteur : conditions ambiantes
-	          printf("=== Temps : %lu ms -> hauteur : %d.%d cm (objectif %u cm) | humidite %u%% ===\r\n",
-	                 (unsigned long)hang_time,
-	                 (int)h_cm, (int)(h_cm * 10.0f + 0.5f) % 10, goal_cm, hum);
+	          printf("Saut : %d.%d cm  (%lu ms)  |  objectif %u cm  |  humidite %u%%\r\n",
+	                 (int)h_cm, (int)(h_cm * 10.0f + 0.5f) % 10,
+	                 (unsigned long)hang_time, goal_cm, hum);
 
 	          /* Affiche la hauteur, puis VICTOIRE (moteur) si l'objectif est atteint */
 	          Display_Height(h_cm);
 	          if (h_int >= goal_cm) {
-	              printf(">>> OBJECTIF ATTEINT ! (%u >= %u cm) <<<\r\n", h_int, goal_cm);
+	              printf("Objectif atteint ! %u cm (>= %u)\r\n", h_int, goal_cm);
 	              Motor_Vibrate(3);            // 3 vibrations = victoire (~1 s)
 	          } else {
-	              printf(">>> Manque %u cm <<<\r\n", (unsigned)(goal_cm - h_int));
+	              printf("Rate : manque %u cm\r\n", (unsigned)(goal_cm - h_int));
 	              HAL_Delay(1500);
 	          }
 	          /* Alterne HAUTEUR, TEMPS en l'air et HUMIDITE, en terminant sur la hauteur. */
