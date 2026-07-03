@@ -381,7 +381,7 @@ int main(void)
 	      static uint8_t  b3_down = 0, b4_down = 0;
 	      static uint16_t last_goal = 0xFFFF;
 	      if (prev_state != APP_SETUP) {
-	          printf("Regle l'objectif avec RV1, puis valide (BTN3/BTN4).\r\n");
+	          printf("Regle l'objectif avec RV2, puis valide (BTN3/BTN4).\r\n");
 	          b3_down = 0; b4_down = 0; last_goal = 0xFFFF;
 	      }
 	      goal_cm = ADC_ReadGoal_cm();
