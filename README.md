@@ -119,4 +119,4 @@ Documentation/                project brief and presentation slides
 
 ## Team
 
-Built by **Julien Gomis**, **Mathis Lenorais-Clere** and **Neil Ben-Othman** for the Microprocessor Systems course at ISEN Toulon.
+Built in pairs by **Julien Gomis** and **Mathis Lenorais-Clere** for the Microprocessor Systems course at ISEN Toulon.
